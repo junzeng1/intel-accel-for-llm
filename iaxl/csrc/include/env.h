@@ -41,6 +41,26 @@ static inline int env_bool(const char *name, int fallback) {
     return atoi(v) != 0;
 }
 
+static inline double env_double(const char *name, double fallback) {
+    const char *v = getenv(name);
+    if (!v || !*v)
+        return fallback;
+    char *end = NULL;
+    double x = strtod(v, &end);
+    if (end == v)
+        return fallback;
+    return x;
+}
+
+static inline double env_watermark(const char *name, double fallback) {
+    double wm = env_double(name, fallback);
+    if (wm > 1.0 && wm <= 100.0)
+        wm /= 100.0;
+    if (wm <= 0.0 || wm > 1.0)
+        return fallback;
+    return wm;
+}
+
 struct Envs {
 
     int IAXL_ZIP_SRC_CAP;
@@ -69,6 +89,13 @@ struct Envs {
     bool IAXL_ZIP_EXPONENT_ONLY;
     int IAXL_CACHE_CACHEGROUP_SIZE;
     int IAXL_CACHE_CACHEGROUP_NUM;
+    bool IAXL_CACHE_AUTO_SPILL_ENABLE;
+    bool IAXL_CACHE_AUTO_SPILL_EVICT_ONLY;
+    double IAXL_CACHE_HIGH_WATERMARK;
+    double IAXL_CACHE_LOW_WATERMARK;
+    int IAXL_CACHE_SPILL_BATCH_GROUPS;
+    int IAXL_CACHE_SPILL_PACE_MS;
+    int IAXL_CACHE_EVICT_GRACE_MS;
 
     bool IAXL_DSA_GD_ENABLE;
     bool IAXL_DSA_GD_RESET_ON_DESTROY;

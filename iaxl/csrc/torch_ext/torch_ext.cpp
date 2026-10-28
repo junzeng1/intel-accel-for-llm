@@ -283,6 +283,110 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("max_groups"))
 
         .def(
+            "spill_groups",
+            [](kv_pool::Mem &self, size_t max_groups, int evict_only_override) {
+                kv_pool::SpillResult res;
+                {
+                    py::gil_scoped_release release;
+                    res = self.spill_groups(max_groups, evict_only_override);
+                }
+                py::dict d;
+                d["triggered"] = res.triggered;
+                d["rounds"] = res.rounds;
+                d["persisted"] = res.persisted_groups;
+                d["bytes_written"] = res.persisted_bytes;
+                d["evicted"] = res.evicted_groups;
+                d["bytes_freed"] = res.evicted_bytes;
+                d["persisted_labels"] = res.persisted_labels;
+                d["evicted_labels"] = res.evicted_labels;
+                return d;
+            },
+            "Spill (persist+evict or evict-only) up to max_groups oldest LRU groups",
+            py::arg("max_groups"), py::arg("evict_only_override") = -1)
+
+        .def(
+            "spill_to_size",
+            [](kv_pool::Mem &self, size_t target_bytes, size_t max_groups,
+               int evict_only_override) {
+                kv_pool::SpillResult res;
+                {
+                    py::gil_scoped_release release;
+                    res = self.spill_to_size(target_bytes, max_groups, evict_only_override);
+                }
+                py::dict d;
+                d["triggered"] = res.triggered;
+                d["rounds"] = res.rounds;
+                d["persisted"] = res.persisted_groups;
+                d["bytes_written"] = res.persisted_bytes;
+                d["evicted"] = res.evicted_groups;
+                d["bytes_freed"] = res.evicted_bytes;
+                d["persisted_labels"] = res.persisted_labels;
+                d["evicted_labels"] = res.evicted_labels;
+                return d;
+            },
+            "Spill (persist+evict or evict-only) oldest LRU groups until current_bytes <= target_bytes",
+            py::arg("target_bytes"), py::arg("max_groups") = 0,
+            py::arg("evict_only_override") = -1)
+
+        .def(
+            "configure_auto_spill",
+            [](kv_pool::Mem &self, bool enabled, bool evict_only, double high_watermark,
+               double low_watermark, size_t batch_groups, size_t pace_ms, size_t evict_grace_ms) {
+                py::gil_scoped_release release;
+                self.configure_auto_spill(enabled, evict_only, high_watermark, low_watermark,
+                                          batch_groups, pace_ms, evict_grace_ms);
+            },
+            "Configure background watermark-driven spill/evict worker", py::arg("enabled"),
+            py::arg("evict_only") = false, py::arg("high_watermark") = 0.80,
+            py::arg("low_watermark") = 0.60, py::arg("batch_groups") = 16,
+            py::arg("pace_ms") = 2, py::arg("evict_grace_ms") = 50)
+
+        .def(
+            "auto_spill_status",
+            [](kv_pool::Mem &self) {
+                kv_pool::AutoSpillStatus st;
+                {
+                    py::gil_scoped_release release;
+                    st = self.auto_spill_status();
+                }
+                py::dict d;
+                d["enabled"] = st.enabled;
+                d["evict_only"] = st.evict_only;
+                d["running"] = st.running;
+                d["high_watermark"] = st.high_watermark;
+                d["low_watermark"] = st.low_watermark;
+                d["high_watermark_bytes"] = st.high_watermark_bytes;
+                d["low_watermark_bytes"] = st.low_watermark_bytes;
+                d["batch_groups"] = st.batch_groups;
+                d["pace_ms"] = st.pace_ms;
+                d["evict_grace_ms"] = st.evict_grace_ms;
+                d["spill_rounds"] = st.spill_rounds;
+                d["auto_persisted_groups"] = st.auto_persisted_groups;
+                d["auto_persisted_bytes"] = st.auto_persisted_bytes;
+                d["auto_evicted_groups"] = st.auto_evicted_groups;
+                d["auto_evicted_bytes"] = st.auto_evicted_bytes;
+                return d;
+            },
+            "Get background auto-spill status dictionary")
+
+        .def(
+            "mark_groups_complete",
+            [](kv_pool::Mem &self, const std::string &label,
+               const std::vector<std::string> &chunk_ids) {
+                py::gil_scoped_release release;
+                self.mark_groups_complete(label, chunk_ids);
+            },
+            "Mark groups as having all layers submitted", py::arg("label"), py::arg("chunk_ids"))
+
+        .def(
+            "stop_background_workers",
+            [](kv_pool::Mem &self) {
+                py::gil_scoped_release release;
+                self.stop_background_workers();
+            },
+            "Stop background auto-spill worker thread")
+
+        .def(
             "set_evict_enabled",
             [](kv_pool::Mem &self, bool enabled) { self.set_evict_enabled(enabled); },
             "Enable/disable eviction (for safe pointer access periods)", py::arg("enabled"))
@@ -320,15 +424,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("is_deletion_guarded", &kv_pool::Mem::is_deletion_guarded,
              "Check if any deletion guard is held")
 
-        .def_property_readonly("size", &kv_pool::Mem::size, "Number of entries in cache")
-        .def_property_readonly("group_count", &kv_pool::Mem::group_count,
-                               "Number of groups in cache")
-        .def_property_readonly("current_bytes", &kv_pool::Mem::current_bytes,
-                               "Current cache size in bytes")
-        .def_property_readonly("capacity_bytes", &kv_pool::Mem::capacity_bytes,
-                               "Maximum cache capacity in bytes")
-        .def("set_capacity_bytes", &kv_pool::Mem::set_capacity_bytes, "Set maximum cache capacity",
-             py::arg("capacity"))
+        .def_property_readonly(
+            "size",
+            [](kv_pool::Mem &self) {
+                py::gil_scoped_release release;
+                return self.size();
+            },
+            "Number of entries in cache")
+        .def_property_readonly(
+            "group_count",
+            [](kv_pool::Mem &self) {
+                py::gil_scoped_release release;
+                return self.group_count();
+            },
+            "Number of groups in cache")
+        .def_property_readonly(
+            "current_bytes",
+            [](kv_pool::Mem &self) {
+                py::gil_scoped_release release;
+                return self.current_bytes();
+            },
+            "Current cache size in bytes")
+        .def_property_readonly(
+            "capacity_bytes",
+            [](kv_pool::Mem &self) {
+                py::gil_scoped_release release;
+                return self.capacity_bytes();
+            },
+            "Maximum cache capacity in bytes")
+        .def(
+            "set_capacity_bytes",
+            [](kv_pool::Mem &self, size_t capacity) {
+                py::gil_scoped_release release;
+                self.set_capacity_bytes(capacity);
+            },
+            "Set maximum cache capacity", py::arg("capacity"))
         .def_property_readonly("hits", &kv_pool::Mem::hits, "Total cache hits")
         .def_property_readonly("hits_in_storage", &kv_pool::Mem::hits_in_storage,
                                "Total cache hits that were loaded from storage")
@@ -341,10 +471,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                "Total compressed bytes accumulated")
         .def_property_readonly("compression_ratio", &kv_pool::Mem::compression_ratio,
                                "Compression ratio (original / compressed)")
-        .def_property_readonly("unpersisted_count", &kv_pool::Mem::unpersisted_count,
-                               "Number of entries not yet persisted to disk")
+        .def_property_readonly(
+            "unpersisted_count",
+            [](kv_pool::Mem &self) {
+                py::gil_scoped_release release;
+                return self.unpersisted_count();
+            },
+            "Number of entries not yet persisted to disk")
         .def("reset_stats", &kv_pool::Mem::reset_stats, "Reset hit/miss/put/eviction counters")
-        .def("clear", &kv_pool::Mem::clear, "Clear all entries")
+        .def(
+            "clear",
+            [](kv_pool::Mem &self) {
+                py::gil_scoped_release release;
+                self.clear();
+            },
+            "Clear all entries")
 
         .def(
             "get_unpersisted",

@@ -54,9 +54,12 @@ double now_seconds() {
 class Record::Impl {
   public:
     Impl(const std::string &sqlite_path, bool cleanup_unpersisted)
-        : sqlite_path_(sqlite_path), db_(nullptr), stmt_(nullptr), queue_("TZ-REC") {
+        : sqlite_path_(sqlite_path), db_(nullptr), read_db_(nullptr), stmt_(nullptr),
+          queue_("TZ-REC") {
 
-        int rc = sqlite3_open(sqlite_path_.c_str(), &db_);
+        int rc = sqlite3_open_v2(sqlite_path_.c_str(), &db_,
+                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX,
+                                 nullptr);
         if (rc != SQLITE_OK) {
             std::string err = "[Record] Failed to open SQLite: " + std::string(sqlite3_errmsg(db_));
             throw std::runtime_error(err);
@@ -94,8 +97,26 @@ class Record::Impl {
         }
 
         const char *insert_sql =
-            "INSERT OR REPLACE INTO chunks (chunk_label, created_at, persisted) VALUES (?, ?, 0)";
+            "INSERT INTO chunks (chunk_label, created_at, persisted) VALUES (?, ?, 0) "
+            "ON CONFLICT(chunk_label) DO UPDATE SET created_at = excluded.created_at";
         SQLITE_CHECK(sqlite3_prepare_v2(db_, insert_sql, -1, &stmt_, nullptr));
+
+        rc = sqlite3_open_v2(sqlite_path_.c_str(), &read_db_,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX,
+                             nullptr);
+        if (rc != SQLITE_OK) {
+            std::string err =
+                "[Record] Failed to open read SQLite: " + std::string(sqlite3_errmsg(read_db_));
+            sqlite3_finalize(stmt_);
+            sqlite3_close(db_);
+            throw std::runtime_error(err);
+        }
+        SQLITE_CHECK(sqlite3_exec(read_db_, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr));
+        SQLITE_CHECK(sqlite3_exec(read_db_, "PRAGMA cache_size=-262144", nullptr, nullptr, nullptr));
+        SQLITE_CHECK(sqlite3_exec(read_db_, "PRAGMA temp_store=MEMORY", nullptr, nullptr, nullptr));
+        SQLITE_CHECK(
+            sqlite3_exec(read_db_, "PRAGMA mmap_size=1073741824", nullptr, nullptr, nullptr));
+        sqlite3_busy_timeout(read_db_, 60000);
 
         queue_.init();
     }
@@ -103,8 +124,8 @@ class Record::Impl {
     ~Impl() { shutdown(); }
 
     void submit(const std::string &label, const std::vector<std::string> &chunk_labels) {
-        std::lock_guard<std::mutex> lock(operation_mutex_);
         auto group_keys = make_group_keys(label, chunk_labels);
+        std::lock_guard<std::mutex> lock(operation_mutex_);
 
         auto future = queue_.submit([this, group_keys = std::move(group_keys)]() {
             double current_time = now_seconds();
@@ -126,71 +147,86 @@ class Record::Impl {
             SQLITE_CHECK(sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr));
         });
 
-        track_future_locked(std::move(future));
+        track_future_locked(future.share());
     }
 
     void mark_persisted(const std::vector<std::string> &chunk_labels) {
         if (chunk_labels.empty())
             return;
-        std::lock_guard<std::mutex> lock(operation_mutex_);
+        std::shared_future<void> shared_fut;
+        {
+            std::lock_guard<std::mutex> lock(operation_mutex_);
 
-        auto future = queue_.submit([this, chunk_labels = chunk_labels]() {
-            SQLITE_CHECK(sqlite3_exec(db_, "PRAGMA synchronous=NORMAL", nullptr, nullptr, nullptr));
+            auto future = queue_.submit([this, chunk_labels = chunk_labels]() {
+                double current_time = now_seconds();
+                SQLITE_CHECK(
+                    sqlite3_exec(db_, "PRAGMA synchronous=NORMAL", nullptr, nullptr, nullptr));
 
-            sqlite3_stmt *update_stmt = nullptr;
-            const char *update_sql = "UPDATE chunks SET persisted = 1 WHERE chunk_label = ?";
+                sqlite3_stmt *update_stmt = nullptr;
+                const char *update_sql =
+                    "INSERT INTO chunks (chunk_label, created_at, persisted) VALUES (?, ?, 1) "
+                    "ON CONFLICT(chunk_label) DO UPDATE SET persisted = 1";
 
-            SQLITE_CHECK(sqlite3_prepare_v2(db_, update_sql, -1, &update_stmt, nullptr));
-            SQLITE_CHECK(sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, nullptr));
+                SQLITE_CHECK(sqlite3_prepare_v2(db_, update_sql, -1, &update_stmt, nullptr));
+                SQLITE_CHECK(sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, nullptr));
 
-            for (const auto &gk : chunk_labels) {
-                sqlite3_reset(update_stmt);
-                sqlite3_bind_text(update_stmt, 1, gk.c_str(), -1, SQLITE_TRANSIENT);
+                for (const auto &gk : chunk_labels) {
+                    sqlite3_reset(update_stmt);
+                    sqlite3_bind_text(update_stmt, 1, gk.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_double(update_stmt, 2, current_time);
 
-                SQLITE_CHECK_DONE(sqlite3_step(update_stmt));
-            }
+                    SQLITE_CHECK_DONE(sqlite3_step(update_stmt));
+                }
 
-            SQLITE_CHECK(sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr));
-            sqlite3_finalize(update_stmt);
+                SQLITE_CHECK(sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr));
+                sqlite3_finalize(update_stmt);
 
-            SQLITE_CHECK(sqlite3_exec(db_, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr));
-        });
+                SQLITE_CHECK(
+                    sqlite3_exec(db_, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr));
+            });
 
-        track_future_locked(std::move(future));
-        sync_locked();
+            shared_fut = future.share();
+            track_future_locked(shared_fut);
+        }
+        shared_fut.get();
     }
 
     void remove(const std::vector<std::string> &chunk_labels) {
         if (chunk_labels.empty())
             return;
-        std::lock_guard<std::mutex> lock(operation_mutex_);
+        std::shared_future<void> shared_fut;
+        {
+            std::lock_guard<std::mutex> lock(operation_mutex_);
 
-        auto future = queue_.submit([this, chunk_labels]() {
-            sqlite3_stmt *delete_stmt = nullptr;
-            const char *delete_sql = "DELETE FROM chunks WHERE chunk_label = ?";
+            auto future = queue_.submit([this, chunk_labels]() {
+                sqlite3_stmt *delete_stmt = nullptr;
+                const char *delete_sql = "DELETE FROM chunks WHERE chunk_label = ?";
 
-            SQLITE_CHECK(sqlite3_prepare_v2(db_, delete_sql, -1, &delete_stmt, nullptr));
-            SQLITE_CHECK(sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, nullptr));
+                SQLITE_CHECK(sqlite3_prepare_v2(db_, delete_sql, -1, &delete_stmt, nullptr));
+                SQLITE_CHECK(sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, nullptr));
 
-            for (const auto &label : chunk_labels) {
-                sqlite3_reset(delete_stmt);
-                sqlite3_bind_text(delete_stmt, 1, label.c_str(), -1, SQLITE_TRANSIENT);
+                for (const auto &label : chunk_labels) {
+                    sqlite3_reset(delete_stmt);
+                    sqlite3_bind_text(delete_stmt, 1, label.c_str(), -1, SQLITE_TRANSIENT);
 
-                SQLITE_CHECK_DONE(sqlite3_step(delete_stmt));
-            }
+                    SQLITE_CHECK_DONE(sqlite3_step(delete_stmt));
+                }
 
-            SQLITE_CHECK(sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr));
-            sqlite3_finalize(delete_stmt);
-        });
+                SQLITE_CHECK(sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr));
+                sqlite3_finalize(delete_stmt);
+            });
 
-        track_future_locked(std::move(future));
-        sync_locked();
+            shared_fut = future.share();
+            track_future_locked(shared_fut);
+        }
+        shared_fut.get();
     }
 
     std::vector<bool> is_persisted(const std::vector<std::string> &chunk_labels) {
-        std::lock_guard<std::mutex> lock(operation_mutex_);
-        sync_locked();
-        assert(db_ && "[Record] db_ must not be null");
+        if (chunk_labels.empty())
+            return {};
+        std::lock_guard<std::mutex> rlock(read_mutex_);
+        assert(read_db_ && "[Record] read_db_ must not be null");
 
         std::vector<bool> results(chunk_labels.size(), false);
         std::unordered_map<std::string, bool> persisted_status;
@@ -210,7 +246,7 @@ class Record::Impl {
             query += ')';
 
             sqlite3_stmt *select_stmt = nullptr;
-            SQLITE_CHECK(sqlite3_prepare_v2(db_, query.c_str(), -1, &select_stmt, nullptr));
+            SQLITE_CHECK(sqlite3_prepare_v2(read_db_, query.c_str(), -1, &select_stmt, nullptr));
 
             for (size_t j = 0; j < count; j++) {
                 sqlite3_bind_text(select_stmt, j + 1, chunk_labels[i + j].c_str(), -1,
@@ -238,15 +274,22 @@ class Record::Impl {
     }
 
     void sync() {
-        std::lock_guard<std::mutex> lock(operation_mutex_);
-        sync_locked();
+        std::list<std::shared_future<void>> futures_copy;
+        {
+            std::lock_guard<std::mutex> lock(operation_mutex_);
+            futures_copy = std::move(futures_);
+            futures_.clear();
+        }
+        wait_futures(futures_copy);
     }
 
     std::vector<bool> has(const std::string &label, const std::vector<std::string> &chunk_labels) {
-        std::lock_guard<std::mutex> lock(operation_mutex_);
-        sync_locked();
+        if (chunk_labels.empty())
+            return {};
+        sync();
 
-        assert(db_ && "[Record] db_ must not be null");
+        std::lock_guard<std::mutex> rlock(read_mutex_);
+        assert(read_db_ && "[Record] read_db_ must not be null");
 
         auto group_keys = make_group_keys(label, chunk_labels);
 
@@ -266,7 +309,7 @@ class Record::Impl {
             query += ')';
 
             sqlite3_stmt *select_stmt = nullptr;
-            int rc = sqlite3_prepare_v2(db_, query.c_str(), -1, &select_stmt, nullptr);
+            int rc = sqlite3_prepare_v2(read_db_, query.c_str(), -1, &select_stmt, nullptr);
             assert(rc == SQLITE_OK && "[Record] has() prepare failed");
             (void)rc;
 
@@ -293,16 +336,22 @@ class Record::Impl {
     }
 
     void shutdown() {
+        sync();
         std::lock_guard<std::mutex> lock(operation_mutex_);
-        if (!db_)
+        std::lock_guard<std::mutex> rlock(read_mutex_);
+        if (!db_ && !read_db_)
             return;
 
-        sync_locked();
         queue_.shutdown();
 
         if (stmt_) {
             sqlite3_finalize(stmt_);
             stmt_ = nullptr;
+        }
+
+        if (read_db_) {
+            sqlite3_close(read_db_);
+            read_db_ = nullptr;
         }
 
         if (db_) {
@@ -313,16 +362,19 @@ class Record::Impl {
 
     size_t pending_count() const {
         std::lock_guard<std::mutex> lock(operation_mutex_);
-        return futures_.size();
+        size_t active = 0;
+        for (const auto &fut : futures_) {
+            if (fut.valid() && fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                ++active;
+            }
+        }
+        return active;
     }
 
   private:
-    void sync_locked() {
-        std::list<std::future<void>> futures_copy = std::move(futures_);
-        futures_.clear();
-
+    static void wait_futures(std::list<std::shared_future<void>> &futures_list) {
         std::exception_ptr first_error;
-        for (auto &future : futures_copy) {
+        for (auto &future : futures_list) {
             if (!future.valid())
                 continue;
             try {
@@ -336,7 +388,7 @@ class Record::Impl {
             std::rethrow_exception(first_error);
     }
 
-    void track_future_locked(std::future<void> future) {
+    void track_future_locked(std::shared_future<void> future) {
         futures_.push_back(std::move(future));
 
         std::exception_ptr first_error;
@@ -359,11 +411,13 @@ class Record::Impl {
 
     std::string sqlite_path_;
     sqlite3 *db_;
+    sqlite3 *read_db_;
     sqlite3_stmt *stmt_;
     TaskQueue queue_;
 
     mutable std::mutex operation_mutex_;
-    std::list<std::future<void>> futures_;
+    mutable std::mutex read_mutex_;
+    std::list<std::shared_future<void>> futures_;
 };
 
 Record::Record(const std::string &sqlite_path, bool cleanup_unpersisted)

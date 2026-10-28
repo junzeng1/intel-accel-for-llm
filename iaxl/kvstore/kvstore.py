@@ -26,6 +26,20 @@ def _get_default_cache_size_gb() -> float:
     return available_bytes / (10 * 1024**3)
 
 
+def _opt_bool(value) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "on"):
+            return True
+        if v in ("0", "false", "no", "off"):
+            return False
+    return bool(value)
+
+
 class KVStoreLocal:
     LABEL = "kv"
 
@@ -142,6 +156,22 @@ class KVStoreLocal:
                 lambda body, s=self: {
                     "rank": s.rank,
                     "result": s.evict(int(body.get("count", 10))),
+                },
+            )
+            mgmt_register(
+                "POST",
+                "/v1/cache/spill",
+                lambda body, s=self: {
+                    "rank": s.rank,
+                    "result": s.spill(
+                        target_usage=(
+                            float(body["target_usage"])
+                            if "target_usage" in body and body["target_usage"] is not None
+                            else None
+                        ),
+                        max_count=int(body.get("count", body.get("max_groups", 0))),
+                        evict_only=_opt_bool(body.get("evict_only")),
+                    ),
                 },
             )
             mgmt_register(
@@ -319,6 +349,20 @@ class KVStoreLocal:
         if self.has_only_mode:
             return {"error": "evict() not available in has-only mode (scheduler)"}
         return self.tensorzip.evict(max_count)
+
+    def spill(
+        self,
+        target_usage: Optional[float] = None,
+        max_count: int = 0,
+        evict_only: Optional[bool] = None,
+    ) -> dict:
+        if self.has_only_mode:
+            return {"error": "spill() not available in has-only mode (scheduler)"}
+        return self.tensorzip.spill(
+            target_usage=target_usage,
+            max_count=max_count,
+            evict_only=evict_only,
+        )
 
     def get_persist_candidates(self, max_count: int) -> List[str]:
         return self.tensorzip.get_persist_candidates(max_count)

@@ -101,6 +101,17 @@ __attribute__((constructor(101))) void envs_init(void) {
     envs.IAXL_ZIP_EXPONENT_ONLY = env_bool("IAXL_ZIP_EXPONENT_ONLY", envs.IAXL_KV_DATA_SHUFFLE);
     envs.IAXL_CACHE_CACHEGROUP_SIZE = env_int("IAXL_CACHE_CACHEGROUP_SIZE", 100);
     envs.IAXL_CACHE_CACHEGROUP_NUM = env_int("IAXL_CACHE_CACHEGROUP_NUM", 100000);
+    envs.IAXL_CACHE_AUTO_SPILL_ENABLE = env_bool("IAXL_CACHE_AUTO_SPILL_ENABLE", 0);
+    envs.IAXL_CACHE_AUTO_SPILL_EVICT_ONLY = env_bool("IAXL_CACHE_AUTO_SPILL_EVICT_ONLY", 0);
+    envs.IAXL_CACHE_HIGH_WATERMARK = env_watermark("IAXL_CACHE_HIGH_WATERMARK", 0.80);
+    envs.IAXL_CACHE_LOW_WATERMARK = env_watermark("IAXL_CACHE_LOW_WATERMARK", 0.60);
+    if (envs.IAXL_CACHE_LOW_WATERMARK >= envs.IAXL_CACHE_HIGH_WATERMARK) {
+        double adjusted = envs.IAXL_CACHE_HIGH_WATERMARK - 0.05;
+        envs.IAXL_CACHE_LOW_WATERMARK = adjusted > 0.0 ? adjusted : 0.0;
+    }
+    envs.IAXL_CACHE_SPILL_BATCH_GROUPS = env_int("IAXL_CACHE_SPILL_BATCH_GROUPS", 16);
+    envs.IAXL_CACHE_SPILL_PACE_MS = env_nonnegative_int("IAXL_CACHE_SPILL_PACE_MS", 2);
+    envs.IAXL_CACHE_EVICT_GRACE_MS = env_nonnegative_int("IAXL_CACHE_EVICT_GRACE_MS", 50);
 
     envs.IAXL_DSA_GD_ENABLE = env_bool("IAXL_DSA_GD_ENABLE", 0);
     envs.IAXL_DSA_GD_RESET_ON_DESTROY = env_bool("IAXL_DSA_GD_RESET_ON_DESTROY", 0);

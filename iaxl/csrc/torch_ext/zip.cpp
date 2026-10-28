@@ -53,7 +53,7 @@ struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
         std::vector<const char *> data_ptrs(n);
         {
             PROFILE_SCOPE("cache_get");
-            auto results = mem->get(chunk_labels, true);
+            auto results = mem->get(chunk_labels, true, /*caller_holds_deletion_guard=*/true);
 
             for (size_t i = 0; i < n; i++) {
                 const auto &[ptr, size] = results[i];

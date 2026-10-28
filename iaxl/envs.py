@@ -44,6 +44,17 @@ def _float_or_none(name: str) -> Optional[float]:
         return None
 
 
+def _watermark(name: str, default: float) -> float:
+    v = _float_or_none(name)
+    if v is None:
+        return default
+    if 1.0 < v <= 100.0:
+        v /= 100.0
+    if v <= 0.0 or v > 1.0:
+        return default
+    return v
+
+
 class Envs:
     def __init__(self) -> None:
         self.IAXL_DEBUG = _bool("IAXL_DEBUG")
@@ -70,6 +81,22 @@ class Envs:
 
         self.IAXL_DDR_POOL_SIZE_GB = _float_or_none("IAXL_DDR_POOL_SIZE_GB")
         self.IAXL_SCRATCH_POOL_SIZE_GB = _int("IAXL_SCRATCH_POOL_SIZE_GB", 8)
+
+        self.IAXL_CACHE_AUTO_SPILL_ENABLE = _bool("IAXL_CACHE_AUTO_SPILL_ENABLE", False)
+        self.IAXL_CACHE_AUTO_SPILL_EVICT_ONLY = _bool(
+            "IAXL_CACHE_AUTO_SPILL_EVICT_ONLY", False
+        )
+        self.IAXL_CACHE_HIGH_WATERMARK = _watermark("IAXL_CACHE_HIGH_WATERMARK", 0.80)
+        self.IAXL_CACHE_LOW_WATERMARK = _watermark("IAXL_CACHE_LOW_WATERMARK", 0.60)
+        if self.IAXL_CACHE_LOW_WATERMARK >= self.IAXL_CACHE_HIGH_WATERMARK:
+            self.IAXL_CACHE_LOW_WATERMARK = max(
+                0.0, self.IAXL_CACHE_HIGH_WATERMARK - 0.05
+            )
+        self.IAXL_CACHE_SPILL_BATCH_GROUPS = max(
+            1, _int("IAXL_CACHE_SPILL_BATCH_GROUPS", 16)
+        )
+        self.IAXL_CACHE_SPILL_PACE_MS = max(0, _int("IAXL_CACHE_SPILL_PACE_MS", 2))
+        self.IAXL_CACHE_EVICT_GRACE_MS = max(0, _int("IAXL_CACHE_EVICT_GRACE_MS", 50))
 
         self.IAXL_PREALLOC_LIMIT = _int("IAXL_PREALLOC_LIMIT", 0)
 

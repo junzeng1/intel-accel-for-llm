@@ -183,6 +183,14 @@ class KVStoreRemote:
     def evict(self, max_count: int) -> dict:
         return self._json(rpc.EVICT, max_count)
 
+    def spill(
+        self,
+        target_usage: Optional[float] = None,
+        max_count: int = 0,
+        evict_only: Optional[bool] = None,
+    ) -> dict:
+        return self._json(rpc.SPILL, target_usage, max_count, evict_only)
+
     def get_persist_candidates(self, max_count: int) -> List[str]:
         return self._json(rpc.PERSIST_CANDIDATES, max_count)
 

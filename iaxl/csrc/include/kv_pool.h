@@ -140,9 +140,35 @@ class Record {
     std::unique_ptr<Impl> impl_;
 };
 
+class StorageBackend {
+  public:
+    struct WriteItem {
+        std::string full_label;
+        const char *data;
+        size_t size;
+    };
+
+    virtual ~StorageBackend() = default;
+
+    virtual bool save(const std::string &full_label, const char *data, size_t size) = 0;
+
+    virtual std::pair<char *, size_t> load(const std::string &full_label) = 0;
+
+    virtual bool remove(const std::string &full_label) {
+        (void)full_label;
+        return true;
+    }
+
+    virtual std::vector<bool> save_batch(const std::vector<WriteItem> &items);
+
+    virtual std::vector<std::pair<char *, size_t>>
+    load_batch(const std::vector<std::string> &full_labels, bool allow_parallel = false);
+};
+
 class Storage {
   public:
     explicit Storage(const std::string &persist_dir);
+    explicit Storage(std::unique_ptr<StorageBackend> backend);
     ~Storage();
 
     Storage(const Storage &) = delete;
@@ -152,9 +178,44 @@ class Storage {
 
     std::pair<char *, size_t> load(const std::string &full_label);
 
+    bool remove(const std::string &full_label);
+
+    std::vector<bool> save_batch(const std::vector<StorageBackend::WriteItem> &items);
+
+    std::vector<std::pair<char *, size_t>>
+    load_batch(const std::vector<std::string> &full_labels, bool allow_parallel = false);
+
   private:
-    class Impl;
-    std::unique_ptr<Impl> impl_;
+    std::unique_ptr<StorageBackend> backend_;
+};
+
+struct SpillResult {
+    bool triggered = false;
+    size_t rounds = 0;
+    size_t persisted_groups = 0;
+    size_t persisted_bytes = 0;
+    size_t evicted_groups = 0;
+    size_t evicted_bytes = 0;
+    std::vector<std::string> persisted_labels;
+    std::vector<std::string> evicted_labels;
+};
+
+struct AutoSpillStatus {
+    bool enabled = false;
+    bool evict_only = false;
+    bool running = false;
+    double high_watermark = 0.80;
+    double low_watermark = 0.60;
+    size_t high_watermark_bytes = 0;
+    size_t low_watermark_bytes = 0;
+    size_t batch_groups = 16;
+    size_t pace_ms = 2;
+    size_t evict_grace_ms = 50;
+    uint64_t spill_rounds = 0;
+    uint64_t auto_persisted_groups = 0;
+    uint64_t auto_persisted_bytes = 0;
+    uint64_t auto_evicted_groups = 0;
+    uint64_t auto_evicted_bytes = 0;
 };
 
 class Mem {
@@ -169,7 +230,8 @@ class Mem {
              const std::vector<size_t> &sizes, const std::vector<size_t> &unzip_sizes = {});
 
     std::vector<std::pair<const char *, size_t>> get(const std::vector<std::string> &keys,
-                                                     bool allow_using_omp = false);
+                                                     bool allow_using_omp = false,
+                                                     bool caller_holds_deletion_guard = false);
 
     std::vector<std::pair<const char *, size_t>> get_unlocked(const std::vector<std::string> &keys,
                                                               bool allow_using_omp = false);
@@ -181,6 +243,22 @@ class Mem {
     std::vector<std::tuple<std::string, size_t>> persist_groups(size_t max_groups);
 
     std::vector<std::tuple<std::string, size_t>> evict_groups(size_t max_groups);
+
+    SpillResult spill_groups(size_t max_groups, int evict_only_override = -1);
+
+    SpillResult spill_to_size(size_t target_bytes, size_t max_groups = 0,
+                              int evict_only_override = -1);
+
+    void configure_auto_spill(bool enabled, bool evict_only, double high_watermark,
+                              double low_watermark, size_t batch_groups = 16,
+                              size_t pace_ms = 2, size_t evict_grace_ms = 50);
+
+    AutoSpillStatus auto_spill_status() const;
+
+    void mark_groups_complete(const std::string &label,
+                              const std::vector<std::string> &chunk_ids);
+
+    void stop_background_workers();
 
     size_t evict_to_size(size_t target_bytes);
     size_t force_evict_to_size(size_t target_bytes);

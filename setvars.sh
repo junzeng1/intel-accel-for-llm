@@ -97,6 +97,13 @@ export IAXL_PREALLOC_LIMIT=${IAXL_PREALLOC_LIMIT:-0}                     # Cap p
 export IAXL_SCRATCH_POOL_SIZE_GB=${IAXL_SCRATCH_POOL_SIZE_GB:-8}         # Pinned scratch pool (GPU<->CPU staging) size in GB
 export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=${IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS:-1} # Store the first N KV layers without compression
 # export IAXL_DDR_POOL_SIZE_GB=...         # DDR (host) cache pool size in GB (unset = 1/10 of RAM)
+export IAXL_CACHE_AUTO_SPILL_ENABLE=${IAXL_CACHE_AUTO_SPILL_ENABLE:-0}         # Enable background watermark-driven persist+evict or evict-only (0/1, default 0)
+export IAXL_CACHE_AUTO_SPILL_EVICT_ONLY=${IAXL_CACHE_AUTO_SPILL_EVICT_ONLY:-0} # When AUTO_SPILL=1: 0=persist then evict (Case C), 1=direct evict without persist (Case B)
+export IAXL_CACHE_HIGH_WATERMARK=${IAXL_CACHE_HIGH_WATERMARK:-0.80}            # High watermark ratio to wake background spill/evict worker (e.g. 0.80)
+export IAXL_CACHE_LOW_WATERMARK=${IAXL_CACHE_LOW_WATERMARK:-0.60}              # Low watermark ratio to pause background spill/evict worker (e.g. 0.60)
+export IAXL_CACHE_SPILL_BATCH_GROUPS=${IAXL_CACHE_SPILL_BATCH_GROUPS:-16}      # Batch group count for spill operations
+export IAXL_CACHE_SPILL_PACE_MS=${IAXL_CACHE_SPILL_PACE_MS:-2}                 # Background worker yield sleep (ms) when active GETs are running
+export IAXL_CACHE_EVICT_GRACE_MS=${IAXL_CACHE_EVICT_GRACE_MS:-50}              # Grace window (ms) between Record unpublish and Mem free in evict-only mode
 
 # ---- Intel QAT (compression accelerator) ------------------------------------
 export IAXL_QAT_DEVICES=${IAXL_QAT_DEVICES:-0}                                   # Comma-separated QAT device indices, e.g. "0,1"

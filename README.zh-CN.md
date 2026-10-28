@@ -7,6 +7,8 @@
 - [IAXL 设计](doc/design/iaxl.md)
 - [KV Zip 设计](doc/design/kv-zip.md)
 - [KVShrink 设计](doc/design/kvshrink.md)
+- [KV Cache 内存池水位限制与自动持久化/淘汰设计](doc/design/kv-pool-auto-spill.zh-CN.md)
+- [KV Cache 内存池水位限制与自动持久化/淘汰使用指南](doc/usage/kv-pool-auto-spill.zh-CN.md)
 
 ## 配置宿主机
 

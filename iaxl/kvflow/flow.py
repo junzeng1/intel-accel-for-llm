@@ -40,6 +40,78 @@ def get_accelerator_device() -> str:
     return None
 
 
+def _storage_device_stats(path: str) -> dict:
+    """Return best-effort Linux block-device read/write counters for a mounted path."""
+    result = {
+        "path": path,
+        "available": False,
+    }
+    try:
+        target = os.path.realpath(path)
+        best_mount = None
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as mountinfo:
+            for line in mountinfo:
+                fields = line.strip().split()
+                if len(fields) < 10 or "-" not in fields:
+                    continue
+                mount_point = fields[4].replace("\\040", " ")
+                if target == mount_point or target.startswith(
+                    mount_point.rstrip("/") + "/"
+                ):
+                    if best_mount is None or len(mount_point) > len(
+                        best_mount["mount_point"]
+                    ):
+                        sep = fields.index("-")
+                        best_mount = {
+                            "mount_point": mount_point,
+                            "fs_type": fields[sep + 1],
+                            "source": fields[sep + 2] if len(fields) > sep + 2 else "",
+                        }
+        if best_mount is None:
+            result["error"] = "mount point not found"
+            return result
+
+        stat = os.stat(best_mount["mount_point"])
+        major = os.major(stat.st_dev)
+        minor = os.minor(stat.st_dev)
+        sysfs_stat = f"/sys/dev/block/{major}:{minor}/stat"
+        result.update(best_mount)
+        result["dev"] = f"{major}:{minor}"
+        result["sysfs_stat"] = sysfs_stat
+
+        with open(sysfs_stat, "r", encoding="utf-8") as stat_file:
+            values = [int(value) for value in stat_file.read().split()]
+        if len(values) < 8:
+            result["error"] = "unexpected block stat format"
+            return result
+
+        read_ios = values[0]
+        read_sectors = values[2]
+        read_ms = values[3]
+        write_ios = values[4]
+        write_sectors = values[6]
+        write_ms = values[7]
+        result.update(
+            {
+                "available": True,
+                "read_ios_total": read_ios,
+                "read_sectors_total": read_sectors,
+                "read_bytes_total": read_sectors * 512,
+                "read_ms_total": read_ms,
+                "read_avg_ms": round(read_ms / read_ios, 4) if read_ios > 0 else 0,
+                "write_ios_total": write_ios,
+                "write_sectors_total": write_sectors,
+                "write_bytes_total": write_sectors * 512,
+                "write_ms_total": write_ms,
+                "write_avg_ms": round(write_ms / write_ios, 4) if write_ios > 0 else 0,
+            }
+        )
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+
+
 @dataclass
 class Task:
     ctx: Any = None
@@ -116,12 +188,30 @@ class KVFlow:
             storage=self.storage,
             record=self.record,
         )
+        self.mem.configure_auto_spill(
+            enabled=envs.IAXL_CACHE_AUTO_SPILL_ENABLE,
+            evict_only=envs.IAXL_CACHE_AUTO_SPILL_EVICT_ONLY,
+            high_watermark=envs.IAXL_CACHE_HIGH_WATERMARK,
+            low_watermark=envs.IAXL_CACHE_LOW_WATERMARK,
+            batch_groups=envs.IAXL_CACHE_SPILL_BATCH_GROUPS,
+            pace_ms=envs.IAXL_CACHE_SPILL_PACE_MS,
+            evict_grace_ms=envs.IAXL_CACHE_EVICT_GRACE_MS,
+        )
 
         logger.info(
-            "Initialized: persist_dir=%s, cache_size_gb=%.2f, compression=%s",
+            "Initialized: persist_dir=%s, cache_size_gb=%.2f, compression=%s, "
+            "auto_spill_enabled=%s, evict_only=%s, high_wm=%.2f, low_wm=%.2f, "
+            "batch_groups=%d, pace_ms=%d, evict_grace_ms=%d",
             persist_dir,
             cache_size_gb,
             self.enable_compression,
+            envs.IAXL_CACHE_AUTO_SPILL_ENABLE,
+            envs.IAXL_CACHE_AUTO_SPILL_EVICT_ONLY,
+            envs.IAXL_CACHE_HIGH_WATERMARK,
+            envs.IAXL_CACHE_LOW_WATERMARK,
+            envs.IAXL_CACHE_SPILL_BATCH_GROUPS,
+            envs.IAXL_CACHE_SPILL_PACE_MS,
+            envs.IAXL_CACHE_EVICT_GRACE_MS,
         )
 
         self._persist_count = 0
@@ -448,6 +538,8 @@ class KVFlow:
     @profile_func(lambda self, label, chunk_labels: f"(count={len(chunk_labels)})")
     def put_finish(self, label: str, chunk_labels: List[str]) -> None:
         assert self.record is not None
+        if not self.has_only_mode and self.mem is not None:
+            self.mem.mark_groups_complete(label, chunk_labels)
         self.record.submit(label, chunk_labels)
 
     @profile_func(lambda self, label, chunk_labels: f"(count={len(chunk_labels)})")
@@ -458,6 +550,8 @@ class KVFlow:
 
     def stop(self):
         logger.info("Stopping...")
+        if not self.has_only_mode and getattr(self, "mem", None) is not None:
+            self.mem.stop_background_workers()
         assert self.record is not None
         self.record.sync()
         logger.info("Stopped")
@@ -471,6 +565,19 @@ class KVFlow:
 
         unpersisted = self.mem.unpersisted_count
         group_count = self.mem.group_count
+        auto_spill = self.mem.auto_spill_status()
+        persisted_total = self._persist_count + int(
+            auto_spill.get("auto_persisted_groups", 0)
+        )
+        persisted_bytes_total = self._persist_bytes + int(
+            auto_spill.get("auto_persisted_bytes", 0)
+        )
+        evicted_total = self._evict_count + int(
+            auto_spill.get("auto_evicted_groups", 0)
+        )
+        evicted_bytes_total = self._evict_bytes + int(
+            auto_spill.get("auto_evicted_bytes", 0)
+        )
 
         pool = self.chunk_pool
         if pool is None:
@@ -513,10 +620,12 @@ class KVFlow:
             ),
             "unpersisted_count": unpersisted,
             "persisted_count": group_count - unpersisted,
-            "persisted_total": self._persist_count,
-            "persisted_bytes_total": self._persist_bytes,
-            "evicted_total": self._evict_count,
-            "evicted_bytes_total": self._evict_bytes,
+            "persisted_total": persisted_total,
+            "persisted_bytes_total": persisted_bytes_total,
+            "evicted_total": evicted_total,
+            "evicted_bytes_total": evicted_bytes_total,
+            "auto_spill": auto_spill,
+            "storage_backend": _storage_device_stats(self.persist_dir),
             "pool_total_tensors": pool_total_tensors,
             "pool_total_bytes": pool_total_bytes,
             "pool_available": pool_available,
@@ -604,4 +713,85 @@ class KVFlow:
             "evicted": len(groups),
             "bytes_freed": total_freed,
             "labels": sorted(groups),
+        }
+
+    def spill(
+        self,
+        target_usage: Optional[float] = None,
+        max_count: int = 0,
+        evict_only: Optional[bool] = None,
+    ) -> dict:
+        if self.has_only_mode:
+            return {
+                "triggered": False,
+                "persisted": 0,
+                "evicted": 0,
+                "error": "has-only mode",
+            }
+
+        evict_only_override = -1 if evict_only is None else (1 if evict_only else 0)
+        if target_usage is not None:
+            if 1.0 < target_usage <= 100.0:
+                target_usage /= 100.0
+            target_usage = max(0.0, min(1.0, float(target_usage)))
+            target_bytes = int(self.cache_size_bytes * target_usage)
+            res = self.mem.spill_to_size(
+                target_bytes=target_bytes,
+                max_groups=max(0, int(max_count)),
+                evict_only_override=evict_only_override,
+            )
+        elif max_count > 0:
+            res = self.mem.spill_groups(
+                max_groups=int(max_count),
+                evict_only_override=evict_only_override,
+            )
+        else:
+            auto_st = self.mem.auto_spill_status()
+            target_bytes = int(
+                auto_st.get(
+                    "low_watermark_bytes",
+                    int(self.cache_size_bytes * envs.IAXL_CACHE_LOW_WATERMARK),
+                )
+            )
+            res = self.mem.spill_to_size(
+                target_bytes=target_bytes,
+                max_groups=0,
+                evict_only_override=evict_only_override,
+            )
+
+        persisted = int(res.get("persisted", 0))
+        bytes_written = int(res.get("bytes_written", 0))
+        evicted = int(res.get("evicted", 0))
+        bytes_freed = int(res.get("bytes_freed", 0))
+
+        self._persist_count += persisted
+        self._persist_bytes += bytes_written
+        self._evict_count += evicted
+        self._evict_bytes += bytes_freed
+
+        cur_bytes = self.mem.current_bytes
+        usage = (
+            round(cur_bytes / self.cache_size_bytes, 4)
+            if self.cache_size_bytes > 0
+            else 0.0
+        )
+        logger.info(
+            "Spill completed: rounds=%d, persisted=%d (%d B), evicted=%d (%d B), usage=%.4f",
+            int(res.get("rounds", 0)),
+            persisted,
+            bytes_written,
+            evicted,
+            bytes_freed,
+            usage,
+        )
+        return {
+            "triggered": bool(res.get("triggered", False)),
+            "rounds": int(res.get("rounds", 0)),
+            "persisted": persisted,
+            "bytes_written": bytes_written,
+            "evicted": evicted,
+            "bytes_freed": bytes_freed,
+            "usage": usage,
+            "current_bytes": cur_bytes,
+            "capacity_bytes": self.cache_size_bytes,
         }

@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 CTRL_BYTES = 4 << 20
 
 HELLO, REGISTER_KV_CACHES, REGISTER_LAYERS, PUT, GET, HAS, STATUS, METRICS, PERSIST, EVICT, \
-    PERSIST_CANDIDATES, EVICT_CANDIDATES, STOP, UNREGISTER = range(14)
+    SPILL, PERSIST_CANDIDATES, EVICT_CANDIDATES, STOP, UNREGISTER = range(15)
 
 REQ_FMT, RESP_FMT, PUSH_FMT = "<cBIQ", "<cIB", "<cIH"
 REQ_SIZE, RESP_SIZE, PUSH_SIZE = (struct.calcsize(f) for f in (REQ_FMT, RESP_FMT, PUSH_FMT))
@@ -303,6 +303,7 @@ class KVStoreService:
         METRICS: _json_call("metrics"),
         PERSIST: _json_call("persist"),
         EVICT: _json_call("evict"),
+        SPILL: _json_call("spill"),
         PERSIST_CANDIDATES: _json_call("get_persist_candidates"),
         EVICT_CANDIDATES: _json_call("get_evict_candidates"),
         STOP: _stop,
