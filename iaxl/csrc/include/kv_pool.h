@@ -110,6 +110,20 @@ inline std::string get_path_from_label(const std::string &full_label) {
     return path.string();
 }
 
+inline std::string get_group_path_from_key(const std::string &group_key) {
+    const auto [label, chunk_id] = parse_group_key(group_key);
+
+    std::filesystem::path path{label};
+    if (chunk_id.size() >= 4) {
+        path /= chunk_id.substr(0, 2);
+        path /= chunk_id.substr(2, 2);
+    } else if (chunk_id.size() >= 2) {
+        path /= chunk_id.substr(0, 2);
+    }
+    path /= chunk_id;
+    return path.string();
+}
+
 class Record {
   public:
     explicit Record(const std::string &sqlite_path, bool cleanup_unpersisted = false);
@@ -148,6 +162,25 @@ class StorageBackend {
         size_t size;
     };
 
+    struct GroupEntryItem {
+        std::string tensor_key;
+        const char *data;
+        size_t size;
+    };
+
+    struct GroupWriteItem {
+        std::string group_key;
+        std::vector<GroupEntryItem> entries;
+    };
+
+    struct LoadedEntry {
+        std::string tensor_key;
+        char *data = nullptr;
+        size_t size = 0;
+    };
+
+    using LoadedGroup = std::vector<LoadedEntry>;
+
     virtual ~StorageBackend() = default;
 
     virtual bool save(const std::string &full_label, const char *data, size_t size) = 0;
@@ -163,6 +196,19 @@ class StorageBackend {
 
     virtual std::vector<std::pair<char *, size_t>>
     load_batch(const std::vector<std::string> &full_labels, bool allow_parallel = false);
+
+    virtual bool save_group(const std::string &group_key,
+                            const std::vector<GroupEntryItem> &entries);
+
+    virtual LoadedGroup load_group(const std::string &group_key);
+
+    virtual bool remove_group(const std::string &group_key);
+
+    virtual std::vector<bool> save_groups_batch(const std::vector<GroupWriteItem> &groups,
+                                                bool allow_parallel = false);
+
+    virtual std::vector<LoadedGroup> load_groups_batch(const std::vector<std::string> &group_keys,
+                                                       bool allow_parallel = false);
 };
 
 class Storage {
@@ -184,6 +230,19 @@ class Storage {
 
     std::vector<std::pair<char *, size_t>>
     load_batch(const std::vector<std::string> &full_labels, bool allow_parallel = false);
+
+    bool save_group(const std::string &group_key,
+                    const std::vector<StorageBackend::GroupEntryItem> &entries);
+
+    StorageBackend::LoadedGroup load_group(const std::string &group_key);
+
+    bool remove_group(const std::string &group_key);
+
+    std::vector<bool> save_groups_batch(const std::vector<StorageBackend::GroupWriteItem> &groups,
+                                        bool allow_parallel = false);
+
+    std::vector<StorageBackend::LoadedGroup>
+    load_groups_batch(const std::vector<std::string> &group_keys, bool allow_parallel = false);
 
   private:
     std::unique_ptr<StorageBackend> backend_;
@@ -257,6 +316,11 @@ class Mem {
 
     void mark_groups_complete(const std::string &label,
                               const std::vector<std::string> &chunk_ids);
+
+    void set_expected_group_size(size_t expected_size);
+    size_t expected_group_size() const;
+
+    void release_group_guards(const std::vector<std::string> &keys);
 
     void stop_background_workers();
 

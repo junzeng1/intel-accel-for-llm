@@ -116,6 +116,7 @@ class KVStoreLocal:
             persist_dir=final_persist_dir,
             cache_size_gb=pool_size_gb,
             rank=rank,
+            num_layers=len(self.layer_names),
         )
         start_profiling()
 

@@ -379,6 +379,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "Mark groups as having all layers submitted", py::arg("label"), py::arg("chunk_ids"))
 
         .def(
+            "set_expected_group_size",
+            [](kv_pool::Mem &self, size_t expected_size) {
+                py::gil_scoped_release release;
+                self.set_expected_group_size(expected_size);
+            },
+            "Set expected number of layer entries per group before persistence eligibility",
+            py::arg("expected_size"))
+        .def_property_readonly("expected_group_size", &kv_pool::Mem::expected_group_size,
+                               "Expected number of entries per group")
+        .def(
+            "release_group_guards",
+            [](kv_pool::Mem &self, const std::vector<std::string> &keys) {
+                py::gil_scoped_release release;
+                self.release_group_guards(keys);
+            },
+            "Release per-group active reader pins", py::arg("keys"))
+
+        .def(
             "stop_background_workers",
             [](kv_pool::Mem &self) {
                 py::gil_scoped_release release;

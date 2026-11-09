@@ -48,8 +48,6 @@ struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
 
         const size_t n = chunk_labels.size();
 
-        mem->acquire_deletion_guard();
-
         std::vector<const char *> data_ptrs(n);
         {
             PROFILE_SCOPE("cache_get");
@@ -59,8 +57,6 @@ struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
                 const auto &[ptr, size] = results[i];
                 (void)size;
                 if (!ptr) {
-                    mem->release_deletion_guard();
-
                     if (!is_retry) {
                         std::cout << "[KVClip] cache miss on unzip (will retry): "
                                   << chunk_labels[i] << "\n";
@@ -85,14 +81,18 @@ struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
             }
         }
 
+        struct GroupPinGuard {
+            kv_pool::Mem *m;
+            const std::vector<std::string> &labels;
+            ~GroupPinGuard() { m->release_group_guards(labels); }
+        } pin_guard{mem, chunk_labels};
+
         {
             PROFILE_SCOPE("decompress");
             METRICS_TIMER_START(metrics_decompress);
             kv_zip_decompress_batch(data_ptrs, cpu_tensors);
             METRICS_ADD_DECOMPRESS(metrics_decompress, metrics_sum_tensor_bytes(cpu_tensors));
         }
-
-        mem->release_deletion_guard();
 
         {
 

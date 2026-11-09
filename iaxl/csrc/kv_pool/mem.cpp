@@ -45,6 +45,7 @@ double now_timestamp() {
 struct SubEntry {
     char *data = nullptr;
     size_t size = 0;
+    bool prefetched_from_storage = false;
 
     ~SubEntry() {
         if (data) {
@@ -58,9 +59,12 @@ struct SubEntry {
 
     SubEntry() = default;
 
-    SubEntry(SubEntry &&other) noexcept : data(other.data), size(other.size) {
+    SubEntry(SubEntry &&other) noexcept
+        : data(other.data), size(other.size),
+          prefetched_from_storage(other.prefetched_from_storage) {
         other.data = nullptr;
         other.size = 0;
+        other.prefetched_from_storage = false;
     }
 
     SubEntry &operator=(SubEntry &&other) noexcept {
@@ -69,8 +73,10 @@ struct SubEntry {
                 free(data);
             data = other.data;
             size = other.size;
+            prefetched_from_storage = other.prefetched_from_storage;
             other.data = nullptr;
             other.size = 0;
+            other.prefetched_from_storage = false;
         }
         return *this;
     }
@@ -86,6 +92,7 @@ struct EntryGroup {
     bool is_persisting = false;
     bool is_unpublishing = false;
     bool is_complete = false;
+    uint32_t active_readers = 0;
 
     uint64_t version = 0;
     uint64_t access_seq = 0;
@@ -96,6 +103,17 @@ struct EntryGroup {
     double last_access = 0.0;
 
     std::unordered_map<std::string, SubEntry> entries;
+    std::vector<char *> retired_buffers;
+
+    void flush_retired_buffers() {
+        if (active_readers == 0 && !is_persisting && !retired_buffers.empty()) {
+            for (char *p : retired_buffers) {
+                if (p)
+                    free(p);
+            }
+            retired_buffers.clear();
+        }
+    }
 
     size_t total_bytes() const {
         size_t total = 0;
@@ -118,7 +136,13 @@ struct EntryGroup {
 
     SubEntry &get_or_create(const std::string &tensor_key) { return entries[tensor_key]; }
 
-    ~EntryGroup() = default;
+    ~EntryGroup() {
+        for (char *p : retired_buffers) {
+            if (p)
+                free(p);
+        }
+        retired_buffers.clear();
+    }
 
     EntryGroup() { entries.reserve((size_t)envs.IAXL_CACHE_CACHEGROUP_SIZE); }
 
@@ -130,18 +154,24 @@ struct EntryGroup {
           unpersisted_prev(other.unpersisted_prev), unpersisted_next(other.unpersisted_next),
           is_persisted(other.is_persisted), is_persisting(other.is_persisting),
           is_unpublishing(other.is_unpublishing), is_complete(other.is_complete),
-          version(other.version), access_seq(other.access_seq),
-          group_key_ptr(other.group_key_ptr), created_at(other.created_at),
-          last_access(other.last_access), entries(std::move(other.entries)) {
+          active_readers(other.active_readers), version(other.version),
+          access_seq(other.access_seq), group_key_ptr(other.group_key_ptr),
+          created_at(other.created_at), last_access(other.last_access),
+          entries(std::move(other.entries)), retired_buffers(std::move(other.retired_buffers)) {
         other.lru_prev = nullptr;
         other.lru_next = nullptr;
         other.unpersisted_prev = nullptr;
         other.unpersisted_next = nullptr;
+        other.active_readers = 0;
         other.group_key_ptr = nullptr;
     }
 
     EntryGroup &operator=(EntryGroup &&other) noexcept {
         if (this != &other) {
+            for (char *p : retired_buffers) {
+                if (p)
+                    free(p);
+            }
             lru_prev = other.lru_prev;
             lru_next = other.lru_next;
             unpersisted_prev = other.unpersisted_prev;
@@ -150,16 +180,19 @@ struct EntryGroup {
             is_persisting = other.is_persisting;
             is_unpublishing = other.is_unpublishing;
             is_complete = other.is_complete;
+            active_readers = other.active_readers;
             version = other.version;
             access_seq = other.access_seq;
             group_key_ptr = other.group_key_ptr;
             created_at = other.created_at;
             last_access = other.last_access;
             entries = std::move(other.entries);
+            retired_buffers = std::move(other.retired_buffers);
             other.lru_prev = nullptr;
             other.lru_next = nullptr;
             other.unpersisted_prev = nullptr;
             other.unpersisted_next = nullptr;
+            other.active_readers = 0;
             other.group_key_ptr = nullptr;
         }
         return *this;
@@ -263,14 +296,65 @@ class Mem::Impl {
     void mark_groups_complete(const std::string &label,
                               const std::vector<std::string> &chunk_ids) {
         auto group_keys = make_group_keys(label, chunk_ids);
+        bool should_notify = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            has_complete_tracking_ = true;
+            for (const auto &gk : group_keys) {
+                auto it = cache_.find(gk);
+                if (it != cache_.end()) {
+                    EntryGroup &group = it->second;
+                    if (expected_group_size_ == 0 || label != "kv" ||
+                        group.entries.size() >= expected_group_size_) {
+                        group.is_complete = true;
+                    } else {
+                        pre_completed_groups_.insert(gk);
+                    }
+                } else {
+                    pre_completed_groups_.insert(gk);
+                }
+            }
+            should_notify = should_notify_spill_unlocked();
+        }
+        if (should_notify) {
+            maybe_notify_spill();
+        }
+    }
+
+    void set_expected_group_size(size_t expected_size) {
         std::lock_guard<std::mutex> lock(mutex_);
-        has_complete_tracking_ = true;
-        for (const auto &gk : group_keys) {
-            auto it = cache_.find(gk);
-            if (it != cache_.end()) {
-                it->second.is_complete = true;
-            } else {
-                pre_completed_groups_.insert(gk);
+        expected_group_size_ = expected_size;
+    }
+
+    size_t expected_group_size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return expected_group_size_;
+    }
+
+    void release_group_guards(const std::vector<std::string> &keys) {
+        if (keys.empty())
+            return;
+        int released = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto &key : keys) {
+                auto [group_key_sv, _] = parse_full_label(key);
+                auto it = cache_.find(std::string(group_key_sv));
+                if (it != cache_.end()) {
+                    EntryGroup &group = it->second;
+                    if (group.active_readers > 0) {
+                        group.active_readers--;
+                        group.flush_retired_buffers();
+                        released++;
+                    }
+                }
+            }
+        }
+        if (released > 0) {
+            int prev = active_group_readers_total_.fetch_sub(released, std::memory_order_acq_rel);
+            if (prev <= released) {
+                std::lock_guard<std::mutex> lk(deletion_cv_mutex_);
+                deletion_cv_.notify_all();
             }
         }
     }
@@ -299,6 +383,17 @@ class Mem::Impl {
             lk, [this] { return deletion_guard_count_.load(std::memory_order_acquire) == 0; });
     }
 
+    void wait_all_readers() {
+        if (deletion_guard_count_.load(std::memory_order_acquire) == 0 &&
+            active_group_readers_total_.load(std::memory_order_acquire) == 0)
+            return;
+        std::unique_lock<std::mutex> lk(deletion_cv_mutex_);
+        deletion_cv_.wait(lk, [this] {
+            return deletion_guard_count_.load(std::memory_order_acquire) == 0 &&
+                   active_group_readers_total_.load(std::memory_order_acquire) == 0;
+        });
+    }
+
     void put(const std::vector<std::string> &keys, std::vector<char *> &&data_ptrs,
              const std::vector<size_t> &sizes, const std::vector<size_t> &unzip_sizes) {
         IAXL_CHECK(keys.size() == data_ptrs.size(),
@@ -311,11 +406,7 @@ class Mem::Impl {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             put_unlocked(keys, std::move(data_ptrs), sizes, unzip_sizes);
-            if (auto_spill_enabled_.load(std::memory_order_relaxed) && high_watermark_bytes_ > 0 &&
-                current_bytes_ >= high_watermark_bytes_ &&
-                !spill_running_.load(std::memory_order_relaxed)) {
-                should_notify = true;
-            }
+            should_notify = should_notify_spill_unlocked();
         }
         if (should_notify) {
             maybe_notify_spill();
@@ -335,33 +426,87 @@ class Mem::Impl {
 
         const size_t n = keys.size();
         std::vector<std::pair<const char *, size_t>> results(n, {nullptr, 0});
+        if (n == 0) {
+            return results;
+        }
         double now = now_timestamp();
+        const bool use_group_pins = caller_holds_deletion_guard && !is_deletion_guarded();
 
         // Phase 1: fast in-memory lookup under lock
         std::vector<size_t> miss_indices;
+        std::vector<std::string> phase1_pinned_groups;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             miss_indices.reserve(n);
+            std::vector<EntryGroup *> hit_groups;
+            hit_groups.reserve(n);
             for (size_t i = 0; i < n; ++i) {
-                results[i] = get_one_unlocked(keys[i], now);
+                EntryGroup *g = nullptr;
+                results[i] = get_one_unlocked(keys[i], now, &g);
                 if (results[i].first == nullptr) {
                     miss_indices.push_back(i);
+                } else if (g != nullptr) {
+                    hit_groups.push_back(g);
                 }
+            }
+
+            if (miss_indices.empty()) {
+                if (use_group_pins && !hit_groups.empty()) {
+                    for (EntryGroup *g : hit_groups) {
+                        g->active_readers++;
+                    }
+                    active_group_readers_total_.fetch_add(static_cast<int>(hit_groups.size()),
+                                                          std::memory_order_acq_rel);
+                }
+                return results;
+            }
+
+            // Temporarily pin Phase-1 hits so they cannot be evicted while Phase 2 reads from disk
+            if (!hit_groups.empty()) {
+                phase1_pinned_groups.reserve(hit_groups.size());
+                for (EntryGroup *g : hit_groups) {
+                    g->active_readers++;
+                    phase1_pinned_groups.push_back(*g->group_key_ptr);
+                }
+                active_group_readers_total_.fetch_add(static_cast<int>(hit_groups.size()),
+                                                      std::memory_order_acq_rel);
             }
         }
 
-        if (miss_indices.empty()) {
-            return results;
-        }
+        auto release_phase1_pins = [this, &phase1_pinned_groups]() {
+            if (phase1_pinned_groups.empty())
+                return;
+            int released = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (const auto &gk : phase1_pinned_groups) {
+                    auto it = cache_.find(gk);
+                    if (it != cache_.end() && it->second.active_readers > 0) {
+                        it->second.active_readers--;
+                        it->second.flush_retired_buffers();
+                        released++;
+                    }
+                }
+            }
+            phase1_pinned_groups.clear();
+            if (released > 0) {
+                if (active_group_readers_total_.fetch_sub(released, std::memory_order_acq_rel) <=
+                    released) {
+                    std::lock_guard<std::mutex> lk(deletion_cv_mutex_);
+                    deletion_cv_.notify_all();
+                }
+            }
+        };
 
         if (!storage_ || !record_) {
+            release_phase1_pins();
             misses_.fetch_add(miss_indices.size(), std::memory_order_relaxed);
             return results;
         }
 
-        // Release caller's deletion guard during slow storage I/O so background eviction
-        // of unrelated cold groups is not blocked while reading from disk.
-        if (caller_holds_deletion_guard) {
+        // If caller explicitly held the legacy global deletion guard, release it during slow disk I/O
+        const bool release_global_guard = caller_holds_deletion_guard && is_deletion_guarded();
+        if (release_global_guard) {
             release_deletion_guard();
         }
 
@@ -372,59 +517,127 @@ class Mem::Impl {
                 if (active)
                     self->acquire_deletion_guard();
             }
-        } restorer{this, caller_holds_deletion_guard};
+        } restorer{this, release_global_guard};
 
-        // Phase 2: lock-free Record check + Storage batch load
-        std::vector<std::string> check_keys;
-        check_keys.reserve(miss_indices.size());
-        for (size_t idx : miss_indices) {
-            auto [group_key_sv, _] = parse_full_label(keys[idx]);
-            check_keys.emplace_back(group_key_sv);
+        // Phase 2: lock-free deduplicated Record check + Storage whole-group batch load
+        std::vector<std::string> unique_miss_groups;
+        unique_miss_groups.reserve(miss_indices.size());
+        std::unordered_map<std::string, size_t> group_to_unique_idx;
+        group_to_unique_idx.reserve(miss_indices.size());
+        std::vector<std::vector<size_t>> group_miss_positions;
+        group_miss_positions.reserve(miss_indices.size());
+
+        for (size_t pos = 0; pos < miss_indices.size(); ++pos) {
+            size_t key_idx = miss_indices[pos];
+            auto [group_key_sv, _] = parse_full_label(keys[key_idx]);
+            std::string gk(group_key_sv);
+            auto [it, inserted] = group_to_unique_idx.emplace(gk, unique_miss_groups.size());
+            if (inserted) {
+                unique_miss_groups.push_back(std::move(gk));
+                group_miss_positions.emplace_back();
+            }
+            group_miss_positions[it->second].push_back(pos);
         }
 
-        std::vector<bool> is_persisted = record_->is_persisted(check_keys);
-        std::vector<size_t> storage_indices;
-        std::vector<std::string> load_keys;
-        storage_indices.reserve(miss_indices.size());
-        load_keys.reserve(miss_indices.size());
+        std::vector<bool> group_persisted = record_->is_persisted(unique_miss_groups);
+        std::vector<std::string> persisted_group_keys;
+        std::vector<size_t> persisted_unique_indices;
+        persisted_group_keys.reserve(unique_miss_groups.size());
+        persisted_unique_indices.reserve(unique_miss_groups.size());
 
-        for (size_t i = 0; i < miss_indices.size(); ++i) {
-            if (is_persisted[i]) {
-                storage_indices.push_back(miss_indices[i]);
-                load_keys.push_back(keys[miss_indices[i]]);
+        size_t unpersisted_miss_count = 0;
+        for (size_t u = 0; u < unique_miss_groups.size(); ++u) {
+            if (group_persisted[u]) {
+                persisted_group_keys.push_back(unique_miss_groups[u]);
+                persisted_unique_indices.push_back(u);
+            } else {
+                unpersisted_miss_count += group_miss_positions[u].size();
             }
         }
 
-        misses_.fetch_add(miss_indices.size() - storage_indices.size(), std::memory_order_relaxed);
-
-        std::vector<std::pair<char *, size_t>> loaded_buffers;
-        if (!storage_indices.empty()) {
-            loaded_buffers = storage_->load_batch(load_keys, allow_using_omp);
+        if (unpersisted_miss_count > 0) {
+            misses_.fetch_add(unpersisted_miss_count, std::memory_order_relaxed);
         }
 
-        // Re-acquire deletion guard BEFORE locking mutex_ and resolving live pointers
+        std::vector<StorageBackend::LoadedGroup> loaded_groups;
+        if (!persisted_group_keys.empty()) {
+            loaded_groups = storage_->load_groups_batch(persisted_group_keys, allow_using_omp);
+        }
+
+        // Legacy fallback for any persisted group stored as individual per-tensor .bin files
+        std::vector<size_t> fallback_key_indices;
+        std::vector<std::string> fallback_load_keys;
+        for (size_t k = 0; k < persisted_group_keys.size(); ++k) {
+            if (loaded_groups[k].empty()) {
+                size_t u = persisted_unique_indices[k];
+                for (size_t pos : group_miss_positions[u]) {
+                    size_t key_idx = miss_indices[pos];
+                    fallback_key_indices.push_back(key_idx);
+                    fallback_load_keys.push_back(keys[key_idx]);
+                }
+            }
+        }
+
+        std::vector<std::pair<char *, size_t>> fallback_loaded_buffers;
+        if (!fallback_load_keys.empty()) {
+            fallback_loaded_buffers = storage_->load_batch(fallback_load_keys, allow_using_omp);
+        }
+
+        // Re-acquire legacy global deletion guard if it was held by caller
         if (restorer.active) {
             acquire_deletion_guard();
             restorer.active = false;
         }
 
-        // Phase 3: insert loaded buffers and resolve live pointers under lock
+        // Phase 3: insert loaded group entries (populating all layers of each group) and resolve pointers
         bool should_notify = false;
+        int new_pins = 0;
+        int released_phase1_pins = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            for (size_t i = 0; i < storage_indices.size(); ++i) {
-                size_t key_index = storage_indices[i];
-                char *buf = loaded_buffers[i].first;
-                size_t sz = loaded_buffers[i].second;
+            for (const auto &gk : phase1_pinned_groups) {
+                auto it = cache_.find(gk);
+                if (it != cache_.end() && it->second.active_readers > 0) {
+                    it->second.active_readers--;
+                    it->second.flush_retired_buffers();
+                    released_phase1_pins++;
+                }
+            }
+            phase1_pinned_groups.clear();
+
+            for (size_t k = 0; k < persisted_group_keys.size(); ++k) {
+                if (!loaded_groups[k].empty()) {
+                    size_t u = persisted_unique_indices[k];
+                    std::unordered_set<std::string> requested_tks;
+                    requested_tks.reserve(group_miss_positions[u].size());
+                    for (size_t pos : group_miss_positions[u]) {
+                        auto [_, tk_sv] = parse_full_label(keys[miss_indices[pos]]);
+                        requested_tks.emplace(tk_sv);
+                    }
+                    put_loaded_group_unlocked(persisted_group_keys[k], std::move(loaded_groups[k]),
+                                              requested_tks, now);
+                }
+            }
+
+            for (size_t i = 0; i < fallback_key_indices.size(); ++i) {
+                size_t key_index = fallback_key_indices[i];
+                char *buf = fallback_loaded_buffers[i].first;
+                size_t sz = fallback_loaded_buffers[i].second;
                 if (buf) {
-                    put_loaded_one_unlocked(keys[key_index], buf, sz, now);
+                    put_loaded_one_unlocked(keys[key_index], buf, sz, now,
+                                            /*prefetched=*/false);
                     hits_in_storage_.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     misses_.fetch_add(1, std::memory_order_relaxed);
                 }
             }
 
-            // Resolve all pointers under the active deletion guard
+            // Resolve all pointers and pin groups if requested
+            std::vector<EntryGroup *> resolved_groups;
+            if (use_group_pins) {
+                resolved_groups.reserve(n);
+            }
+            bool all_resolved = true;
             for (size_t i = 0; i < n; ++i) {
                 auto [group_key_sv, tensor_key_sv] = parse_full_label(keys[i]);
                 auto it = cache_.find(std::string(group_key_sv));
@@ -432,16 +645,32 @@ class Mem::Impl {
                     SubEntry *sub = it->second.find(tensor_key_sv);
                     if (sub && sub->data) {
                         results[i] = {sub->data, sub->size};
+                        if (use_group_pins) {
+                            resolved_groups.push_back(&it->second);
+                        }
                         continue;
                     }
                 }
                 results[i] = {nullptr, 0};
+                all_resolved = false;
             }
 
-            if (auto_spill_enabled_.load(std::memory_order_relaxed) && high_watermark_bytes_ > 0 &&
-                current_bytes_ >= high_watermark_bytes_ &&
-                !spill_running_.load(std::memory_order_relaxed)) {
-                should_notify = true;
+            if (use_group_pins && all_resolved) {
+                for (EntryGroup *g : resolved_groups) {
+                    g->active_readers++;
+                }
+                new_pins = static_cast<int>(resolved_groups.size());
+            }
+
+            should_notify = should_notify_spill_unlocked();
+        }
+
+        if (new_pins != released_phase1_pins) {
+            int delta = new_pins - released_phase1_pins;
+            int prev = active_group_readers_total_.fetch_add(delta, std::memory_order_acq_rel);
+            if (delta < 0 && prev + delta <= 0) {
+                std::lock_guard<std::mutex> lk(deletion_cv_mutex_);
+                deletion_cv_.notify_all();
             }
         }
 
@@ -470,11 +699,12 @@ class Mem::Impl {
 
         struct GroupSnap {
             std::string group_key;
-            uint64_t version;
-            std::vector<std::pair<std::string, std::vector<char>>> entries;
+            uint64_t version = 0;
+            size_t total_bytes = 0;
+            std::vector<StorageBackend::GroupEntryItem> entries;
         };
 
-        // Phase 1: snapshot unpersisted groups under lock
+        // Phase 1: select unpersisted groups under lock using zero-copy pointers
         std::vector<GroupSnap> group_snaps;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -489,10 +719,8 @@ class Mem::Impl {
                     gsnap.entries.reserve(group->entries.size());
                     for (const auto &[tensor_key, sub] : group->entries) {
                         if (sub.data && sub.size > 0) {
-                            std::string full_label = make_full_label(gsnap.group_key, tensor_key);
-                            gsnap.entries.emplace_back(
-                                std::move(full_label),
-                                std::vector<char>(sub.data, sub.data + sub.size));
+                            gsnap.entries.push_back({tensor_key, sub.data, sub.size});
+                            gsnap.total_bytes += sub.size;
                         }
                     }
                     group_snaps.push_back(std::move(gsnap));
@@ -505,41 +733,45 @@ class Mem::Impl {
             return {};
         }
 
-        // Phase 2: write to Storage outside lock
-        std::vector<std::string> succeeded_groups;
-        std::unordered_map<std::string, size_t> group_bytes;
-        succeeded_groups.reserve(group_snaps.size());
-
+        // Phase 2: write aggregated group files to Storage outside lock
+        std::vector<StorageBackend::GroupWriteItem> write_groups;
+        write_groups.reserve(group_snaps.size());
         for (const auto &gsnap : group_snaps) {
-            std::vector<StorageBackend::WriteItem> write_items;
-            write_items.reserve(gsnap.entries.size());
-            size_t total_sz = 0;
-            for (const auto &[fl, buf] : gsnap.entries) {
-                write_items.push_back({fl, buf.data(), buf.size()});
-                total_sz += buf.size();
-            }
-            auto res = storage_->save_batch(write_items);
-            bool all_ok = !res.empty();
-            for (bool ok : res) {
-                if (!ok) {
-                    all_ok = false;
-                    break;
+            write_groups.push_back({gsnap.group_key, gsnap.entries});
+        }
+        std::vector<bool> save_results = storage_->save_groups_batch(write_groups, /*allow_parallel=*/true);
+
+        // Phase 3a: verify version under lock BEFORE marking persisted in Record
+        std::vector<std::string> valid_persisted_keys;
+        std::vector<std::string> stale_persisted_keys;
+        valid_persisted_keys.reserve(group_snaps.size());
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (size_t i = 0; i < group_snaps.size(); ++i) {
+                if (!save_results[i])
+                    continue;
+                auto it = cache_.find(group_snaps[i].group_key);
+                if (it != cache_.end() && it->second.version == group_snaps[i].version) {
+                    valid_persisted_keys.push_back(group_snaps[i].group_key);
+                } else {
+                    stale_persisted_keys.push_back(group_snaps[i].group_key);
                 }
             }
-            if (all_ok) {
-                succeeded_groups.push_back(gsnap.group_key);
-                group_bytes[gsnap.group_key] = total_sz;
-            }
         }
 
-        if (record_ && !succeeded_groups.empty()) {
-            record_->mark_persisted(succeeded_groups);
+        // Phase 3b: commit Record metadata for unmodified groups only
+        if (record_ && !valid_persisted_keys.empty()) {
+            record_->mark_persisted(valid_persisted_keys);
+        }
+        for (const auto &stale_key : stale_persisted_keys) {
+            storage_->remove_group(stale_key);
         }
 
-        // Phase 3: update in-memory state with version check under lock
-        std::unordered_set<std::string> succeeded_set(succeeded_groups.begin(),
-                                                      succeeded_groups.end());
+        // Phase 3c: finalize in-memory state under lock
+        std::unordered_set<std::string> valid_set(valid_persisted_keys.begin(),
+                                                  valid_persisted_keys.end());
         std::vector<std::tuple<std::string, size_t>> persisted_groups;
+        std::vector<std::string> late_stale_keys;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (const auto &gsnap : group_snaps) {
@@ -548,14 +780,22 @@ class Mem::Impl {
                     continue;
                 EntryGroup &group = it->second;
                 group.is_persisting = false;
-                if (succeeded_set.count(gsnap.group_key) > 0) {
-                    if (group.version == gsnap.version && !group.is_persisted) {
-                        group.is_persisted = true;
-                        unpersisted_remove(&group);
+                group.flush_retired_buffers();
+                if (valid_set.count(gsnap.group_key) > 0) {
+                    if (group.version == gsnap.version) {
+                        if (!group.is_persisted) {
+                            group.is_persisted = true;
+                            unpersisted_remove(&group);
+                        }
+                        persisted_groups.emplace_back(gsnap.group_key, gsnap.total_bytes);
+                    } else {
+                        late_stale_keys.push_back(gsnap.group_key);
                     }
-                    persisted_groups.emplace_back(gsnap.group_key, group_bytes[gsnap.group_key]);
                 }
             }
+        }
+        for (const auto &stale_key : late_stale_keys) {
+            storage_->remove_group(stale_key);
         }
 
         return persisted_groups;
@@ -584,7 +824,8 @@ class Mem::Impl {
             EntryGroup *group = lru_head_.lru_next;
             while (group != &lru_head_ && candidates.size() < max_groups) {
                 EntryGroup *next = group->lru_next;
-                if (!group->is_persisting && !group->is_unpublishing && !group->entries.empty()) {
+                if (!group->is_persisting && !group->is_unpublishing &&
+                    group->active_readers == 0 && !group->entries.empty()) {
                     group->is_unpublishing = true;
                     const std::string &gk = *group->group_key_ptr;
                     const std::string &tk = group->entries.begin()->first;
@@ -635,8 +876,8 @@ class Mem::Impl {
                     continue;
                 EntryGroup &group = it->second;
                 group.is_unpublishing = false;
-                if (!is_deletion_guarded() && group.version == c.version &&
-                    group.access_seq == c.access_seq) {
+                if (!is_deletion_guarded() && group.active_readers == 0 &&
+                    group.version == c.version && group.access_seq == c.access_seq) {
                     size_t freed = remove_unlocked(c.rep_full_label);
                     evictions_.fetch_add(1, std::memory_order_relaxed);
                     evicted_groups.emplace_back(c.group_key, freed);
@@ -705,80 +946,95 @@ class Mem::Impl {
             return results;
         }
 
-        if (!storage_) {
+        if (!storage_ || !record_) {
             misses_.fetch_add(miss_indices.size(), std::memory_order_relaxed);
             return results;
         }
 
-        std::vector<size_t> storage_indices;
-        storage_indices.reserve(miss_indices.size());
+        std::vector<std::string> unique_miss_groups;
+        unique_miss_groups.reserve(miss_indices.size());
+        std::unordered_map<std::string, size_t> group_to_unique_idx;
+        group_to_unique_idx.reserve(miss_indices.size());
+        std::vector<std::vector<size_t>> group_miss_positions;
+        group_miss_positions.reserve(miss_indices.size());
 
-        if (record_) {
-            std::vector<std::string> check_keys;
-            check_keys.reserve(miss_indices.size());
-            for (size_t idx : miss_indices) {
-                auto [group_key_sv, _] = parse_full_label(keys[idx]);
-                check_keys.emplace_back(group_key_sv);
+        for (size_t pos = 0; pos < miss_indices.size(); ++pos) {
+            size_t key_idx = miss_indices[pos];
+            auto [group_key_sv, _] = parse_full_label(keys[key_idx]);
+            std::string gk(group_key_sv);
+            auto [it, inserted] = group_to_unique_idx.emplace(gk, unique_miss_groups.size());
+            if (inserted) {
+                unique_miss_groups.push_back(std::move(gk));
+                group_miss_positions.emplace_back();
             }
+            group_miss_positions[it->second].push_back(pos);
+        }
 
-            std::vector<bool> is_persisted = record_->is_persisted(check_keys);
+        std::vector<bool> group_persisted = record_->is_persisted(unique_miss_groups);
+        std::vector<std::string> persisted_group_keys;
+        std::vector<size_t> persisted_unique_indices;
+        size_t unpersisted_miss_count = 0;
+        for (size_t u = 0; u < unique_miss_groups.size(); ++u) {
+            if (group_persisted[u]) {
+                persisted_group_keys.push_back(unique_miss_groups[u]);
+                persisted_unique_indices.push_back(u);
+            } else {
+                unpersisted_miss_count += group_miss_positions[u].size();
+            }
+        }
+        if (unpersisted_miss_count > 0) {
+            misses_.fetch_add(unpersisted_miss_count, std::memory_order_relaxed);
+        }
+        if (persisted_group_keys.empty()) {
+            return results;
+        }
 
-            for (size_t i = 0; i < miss_indices.size(); ++i) {
-                if (is_persisted[i]) {
-                    storage_indices.push_back(miss_indices[i]);
-                } else {
+        auto loaded_groups = storage_->load_groups_batch(persisted_group_keys, allow_using_omp);
+
+        std::vector<size_t> fallback_key_indices;
+        std::vector<std::string> fallback_load_keys;
+        for (size_t k = 0; k < persisted_group_keys.size(); ++k) {
+            if (!loaded_groups[k].empty()) {
+                size_t u = persisted_unique_indices[k];
+                std::unordered_set<std::string> requested_tks;
+                for (size_t pos : group_miss_positions[u]) {
+                    auto [_, tk_sv] = parse_full_label(keys[miss_indices[pos]]);
+                    requested_tks.emplace(tk_sv);
+                }
+                put_loaded_group_unlocked(persisted_group_keys[k], std::move(loaded_groups[k]),
+                                          requested_tks, now);
+            } else {
+                size_t u = persisted_unique_indices[k];
+                for (size_t pos : group_miss_positions[u]) {
+                    size_t key_idx = miss_indices[pos];
+                    fallback_key_indices.push_back(key_idx);
+                    fallback_load_keys.push_back(keys[key_idx]);
                 }
             }
-            misses_.fetch_add(miss_indices.size() - storage_indices.size(),
-                              std::memory_order_relaxed);
-        } else {
-
-            misses_.fetch_add(miss_indices.size(), std::memory_order_relaxed);
-            return results;
         }
 
-        if (storage_indices.empty()) {
-            return results;
-        }
-
-        struct LoadedData {
-            size_t index;
-            char *buffer;
-            size_t size;
-        };
-        std::vector<LoadedData> loaded_data(storage_indices.size());
-
-        if (allow_using_omp) {
-#pragma omp parallel for schedule(dynamic)
-            for (size_t i = 0; i < storage_indices.size(); ++i) {
-                size_t key_index = storage_indices[i];
-                auto [buffer, size] = storage_->load(keys[key_index]);
-                loaded_data[i] = {key_index, buffer, size};
-            }
-        } else {
-            for (size_t i = 0; i < storage_indices.size(); ++i) {
-                size_t key_index = storage_indices[i];
-                auto [buffer, size] = storage_->load(keys[key_index]);
-                loaded_data[i] = {key_index, buffer, size};
+        if (!fallback_load_keys.empty()) {
+            auto fallback_buffers = storage_->load_batch(fallback_load_keys, allow_using_omp);
+            for (size_t i = 0; i < fallback_key_indices.size(); ++i) {
+                size_t key_index = fallback_key_indices[i];
+                if (fallback_buffers[i].first) {
+                    put_loaded_one_unlocked(keys[key_index], fallback_buffers[i].first,
+                                            fallback_buffers[i].second, now, /*prefetched=*/false);
+                    hits_in_storage_.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    misses_.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
 
-        for (const auto &item : loaded_data) {
-            if (item.buffer) {
-
-                put_one_unlocked(keys[item.index], item.buffer, item.size, 0, now);
-
-                mark_persisted_unlocked({keys[item.index]});
-
-                hits_in_storage_.fetch_add(1, std::memory_order_relaxed);
-
-                auto [group_key_sv, tensor_key_sv] = parse_full_label(keys[item.index]);
-                auto it = cache_.find(std::string(group_key_sv));
+        for (size_t idx : miss_indices) {
+            auto [group_key_sv, tensor_key_sv] = parse_full_label(keys[idx]);
+            auto it = cache_.find(std::string(group_key_sv));
+            if (it != cache_.end()) {
                 SubEntry *sub = it->second.find(tensor_key_sv);
-                results[item.index] = {sub->data, sub->size};
-            } else {
-
-                misses_.fetch_add(1, std::memory_order_relaxed);
+                if (sub && sub->data) {
+                    results[idx] = {sub->data, sub->size};
+                }
             }
         }
 
@@ -887,7 +1143,7 @@ class Mem::Impl {
     }
 
     size_t force_evict_to_size(size_t target_bytes) {
-        wait_deletion_guard();
+        wait_all_readers();
         std::vector<std::string> unpersisted_groups_to_remove;
         size_t evicted = 0;
         {
@@ -901,7 +1157,7 @@ class Mem::Impl {
     }
 
     size_t remove(const std::string &key) {
-        wait_deletion_guard();
+        wait_all_readers();
         std::lock_guard<std::mutex> lock(mutex_);
         return remove_unlocked(key);
     }
@@ -1027,12 +1283,64 @@ class Mem::Impl {
         spill_cv_.notify_one();
     }
 
+    bool is_group_complete_unlocked(const EntryGroup &group) const {
+        if (group.entries.empty()) {
+            return false;
+        }
+        if (expected_group_size_ > 0 && group.group_key_ptr != nullptr &&
+            parse_group_key(*group.group_key_ptr).first == "kv") {
+            return group.entries.size() >= expected_group_size_;
+        }
+        if (has_complete_tracking_) {
+            return group.is_complete;
+        }
+        return true;
+    }
+
+    bool has_eligible_unpersisted_unlocked(double now) const {
+        const EntryGroup *group = unpersisted_head_.unpersisted_next;
+        while (group != &unpersisted_head_) {
+            if (!group->is_persisting && !group->is_unpublishing && !group->entries.empty()) {
+                if (is_group_complete_unlocked(*group)) {
+                    return true;
+                }
+                if (expected_group_size_ == 0 && (now - group->last_access) > 0.05) {
+                    return true;
+                }
+            }
+            group = group->unpersisted_next;
+        }
+        return false;
+    }
+
+    bool should_notify_spill_unlocked() const {
+        if (!auto_spill_enabled_.load(std::memory_order_relaxed) ||
+            spill_running_.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        if (high_watermark_bytes_ > 0 && current_bytes_ >= high_watermark_bytes_) {
+            return true;
+        }
+        if (!auto_spill_evict_only_.load(std::memory_order_relaxed) && storage_ != nullptr &&
+            low_watermark_bytes_ > 0 && current_bytes_ >= low_watermark_bytes_) {
+            return has_eligible_unpersisted_unlocked(now_timestamp());
+        }
+        return false;
+    }
+
     bool should_run_auto_spill() const {
         if (!auto_spill_enabled_.load(std::memory_order_acquire)) {
             return false;
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        return high_watermark_bytes_ > 0 && current_bytes_ >= high_watermark_bytes_;
+        if (high_watermark_bytes_ > 0 && current_bytes_ >= high_watermark_bytes_) {
+            return true;
+        }
+        if (!auto_spill_evict_only_.load(std::memory_order_acquire) && storage_ != nullptr &&
+            low_watermark_bytes_ > 0 && current_bytes_ >= low_watermark_bytes_) {
+            return has_eligible_unpersisted_unlocked(now_timestamp());
+        }
+        return false;
     }
 
     void spill_worker_loop() {
@@ -1056,30 +1364,191 @@ class Mem::Impl {
             spill_running_.store(true, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> op_lk(spill_op_mutex_);
+                size_t high_wm_bytes = 0;
                 size_t low_wm_bytes = 0;
+                size_t cur_bytes = 0;
                 bool evict_only = false;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
+                    high_wm_bytes = high_watermark_bytes_;
                     low_wm_bytes = low_watermark_bytes_;
+                    cur_bytes = current_bytes_;
                     evict_only = auto_spill_evict_only_.load(std::memory_order_acquire);
                 }
-                run_spill_loop(low_wm_bytes, /*use_target_bytes=*/true, /*max_groups=*/0,
-                               evict_only, /*is_auto_worker=*/true);
+                if (high_wm_bytes > 0 && cur_bytes >= high_wm_bytes) {
+                    run_spill_loop(low_wm_bytes, /*use_target_bytes=*/true, /*max_groups=*/0,
+                                   evict_only, /*is_auto_worker=*/true);
+                }
+                if (!evict_only && storage_ != nullptr && low_wm_bytes > 0) {
+                    run_pre_persist_loop(low_wm_bytes, high_wm_bytes);
+                }
             }
             spill_running_.store(false, std::memory_order_release);
         }
     }
 
-    bool is_candidate_eligible_unlocked(const EntryGroup &group, bool allow_incomplete,
-                                        double now) const {
+    bool is_candidate_eligible_unlocked(const EntryGroup &group, bool allow_incomplete, double now,
+                                        bool for_persist) const {
         if (group.is_persisting || group.is_unpublishing || group.entries.empty()) {
             return false;
         }
-        if (allow_incomplete || !has_complete_tracking_ || group.is_complete) {
+        if (!for_persist && group.active_readers > 0) {
+            return false;
+        }
+        if (is_group_complete_unlocked(group)) {
             return true;
         }
-        // Fallback safety: if a group has not been written for > 50ms, treat it as eligible
-        return (now - group.last_access) > 0.05;
+        if (for_persist && expected_group_size_ > 0 && group.group_key_ptr != nullptr &&
+            parse_group_key(*group.group_key_ptr).first == "kv") {
+            // Never persist a half-written KV group unless it has been stalled for > 5s
+            return allow_incomplete && (now - group.last_access) > 5.0;
+        }
+        if (allow_incomplete) {
+            return true;
+        }
+        // Fallback safety when expected_group_size_ is not configured
+        return expected_group_size_ == 0 && (now - group.last_access) > 0.05;
+    }
+
+    void run_pre_persist_loop(size_t low_wm_bytes, size_t high_wm_bytes) {
+        while (!spill_stop_.load(std::memory_order_acquire) &&
+               auto_spill_enabled_.load(std::memory_order_acquire) &&
+               !auto_spill_evict_only_.load(std::memory_order_acquire)) {
+            size_t cur_bytes = 0;
+            size_t pace_ms = 0;
+            size_t batch_limit = 16;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                cur_bytes = current_bytes_;
+                pace_ms = spill_pace_ms_;
+                batch_limit = spill_batch_groups_;
+            }
+            if (cur_bytes < low_wm_bytes) {
+                break;
+            }
+            if (high_wm_bytes > 0 && cur_bytes >= high_wm_bytes) {
+                run_spill_loop(low_wm_bytes, /*use_target_bytes=*/true, /*max_groups=*/0,
+                               /*evict_only=*/false, /*is_auto_worker=*/true);
+                continue;
+            }
+
+            if (pace_ms > 0 && (active_gets_.load(std::memory_order_relaxed) > 0 ||
+                                active_group_readers_total_.load(std::memory_order_relaxed) > 0 ||
+                                is_deletion_guarded())) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(pace_ms));
+            }
+
+            if (!pre_persist_batch_step(batch_limit)) {
+                break;
+            }
+        }
+    }
+
+    bool pre_persist_batch_step(size_t batch_limit) {
+        if (!storage_ || batch_limit == 0) {
+            return false;
+        }
+
+        struct PrePersistSnap {
+            std::string group_key;
+            uint64_t version = 0;
+            size_t written_bytes = 0;
+            std::vector<StorageBackend::GroupEntryItem> entries;
+        };
+
+        std::vector<PrePersistSnap> batch;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            double now = now_timestamp();
+            EntryGroup *group = unpersisted_head_.unpersisted_next;
+            while (group != &unpersisted_head_ && batch.size() < batch_limit) {
+                EntryGroup *next = group->unpersisted_next;
+                if (is_candidate_eligible_unlocked(*group, /*allow_incomplete=*/false, now,
+                                                   /*for_persist=*/true)) {
+                    group->is_persisting = true;
+                    PrePersistSnap snap;
+                    snap.group_key = *group->group_key_ptr;
+                    snap.version = group->version;
+                    snap.entries.reserve(group->entries.size());
+                    for (const auto &[tensor_key, sub] : group->entries) {
+                        if (sub.data && sub.size > 0) {
+                            snap.entries.push_back({tensor_key, sub.data, sub.size});
+                            snap.written_bytes += sub.size;
+                        }
+                    }
+                    batch.push_back(std::move(snap));
+                }
+                group = next;
+            }
+        }
+
+        if (batch.empty()) {
+            return false;
+        }
+
+        std::vector<StorageBackend::GroupWriteItem> write_groups;
+        write_groups.reserve(batch.size());
+        for (const auto &snap : batch) {
+            write_groups.push_back({snap.group_key, snap.entries});
+        }
+        std::vector<bool> save_res =
+            storage_->save_groups_batch(write_groups, /*allow_parallel=*/false);
+
+        std::vector<std::string> valid_keys;
+        std::vector<std::string> stale_keys;
+        valid_keys.reserve(batch.size());
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (size_t i = 0; i < batch.size(); ++i) {
+                if (!save_res[i])
+                    continue;
+                auto it = cache_.find(batch[i].group_key);
+                if (it != cache_.end() && it->second.version == batch[i].version) {
+                    valid_keys.push_back(batch[i].group_key);
+                } else {
+                    stale_keys.push_back(batch[i].group_key);
+                }
+            }
+        }
+
+        if (record_ && !valid_keys.empty()) {
+            record_->mark_persisted(valid_keys);
+        }
+        for (const auto &sk : stale_keys) {
+            storage_->remove_group(sk);
+        }
+
+        std::unordered_set<std::string> valid_set(valid_keys.begin(), valid_keys.end());
+        std::vector<std::string> late_stale_keys;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto &snap : batch) {
+                auto it = cache_.find(snap.group_key);
+                if (it == cache_.end())
+                    continue;
+                EntryGroup &group = it->second;
+                group.is_persisting = false;
+                group.flush_retired_buffers();
+                if (valid_set.count(snap.group_key) > 0) {
+                    if (group.version == snap.version) {
+                        if (!group.is_persisted) {
+                            group.is_persisted = true;
+                            unpersisted_remove(&group);
+                        }
+                        auto_persisted_groups_.fetch_add(1, std::memory_order_relaxed);
+                        auto_persisted_bytes_.fetch_add(snap.written_bytes,
+                                                        std::memory_order_relaxed);
+                    } else {
+                        late_stale_keys.push_back(snap.group_key);
+                    }
+                }
+            }
+        }
+        for (const auto &sk : late_stale_keys) {
+            storage_->remove_group(sk);
+        }
+
+        return true;
     }
 
     SpillResult run_spill_loop(size_t target_bytes, bool use_target_bytes, size_t max_groups,
@@ -1104,42 +1573,42 @@ class Mem::Impl {
 
             size_t cur_bytes = 0;
             size_t pace_ms = 0;
+            size_t step_limit = 1;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 cur_bytes = current_bytes_;
                 pace_ms = spill_pace_ms_;
+                if (max_groups > 0) {
+                    step_limit =
+                        std::min<size_t>(spill_batch_groups_, max_groups - groups_processed);
+                } else if (use_target_bytes && current_bytes_ > target_bytes && !cache_.empty()) {
+                    size_t avg_bytes = std::max<size_t>(1, current_bytes_ / cache_.size());
+                    size_t excess = current_bytes_ - target_bytes;
+                    size_t est = std::max<size_t>(1, (excess + avg_bytes - 1) / avg_bytes);
+                    step_limit = std::min<size_t>(spill_batch_groups_, est);
+                } else {
+                    step_limit = spill_batch_groups_;
+                }
             }
             if (use_target_bytes && cur_bytes <= target_bytes) {
                 break;
             }
 
             if (is_auto_worker && pace_ms > 0 &&
-                (active_gets_.load(std::memory_order_relaxed) > 0 || is_deletion_guarded())) {
+                (active_gets_.load(std::memory_order_relaxed) > 0 ||
+                 active_group_readers_total_.load(std::memory_order_relaxed) > 0 ||
+                 is_deletion_guarded())) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(pace_ms));
             }
 
             bool made_progress = false;
             if (evict_only) {
-                size_t step_limit = 1;
-                if (max_groups > 0) {
-                    step_limit = std::min<size_t>(spill_batch_groups_, max_groups - groups_processed);
-                } else {
-                    // Estimate how many groups to evict in this batch without overshooting low watermark
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if (use_target_bytes && current_bytes_ > target_bytes && !cache_.empty()) {
-                        size_t avg_bytes = std::max<size_t>(1, current_bytes_ / cache_.size());
-                        size_t excess = current_bytes_ - target_bytes;
-                        size_t est = std::max<size_t>(1, (excess + avg_bytes - 1) / avg_bytes);
-                        step_limit = std::min<size_t>(spill_batch_groups_, est);
-                    } else {
-                        step_limit = spill_batch_groups_;
-                    }
-                }
-                made_progress = spill_step_evict_only(step_limit, is_auto_worker, result,
-                                                      groups_processed);
-            } else {
                 made_progress =
-                    spill_step_persist_then_evict(is_auto_worker, result, groups_processed);
+                    spill_step_evict_only(step_limit, is_auto_worker, result, groups_processed);
+            } else {
+                made_progress = spill_step_persist_then_evict(
+                    step_limit, target_bytes, use_target_bytes, max_groups, is_auto_worker, result,
+                    groups_processed);
             }
 
             if (!made_progress) {
@@ -1152,9 +1621,11 @@ class Mem::Impl {
         return result;
     }
 
-    bool spill_step_persist_then_evict(bool is_auto_worker, SpillResult &result,
+    bool spill_step_persist_then_evict(size_t step_limit, size_t target_bytes,
+                                       bool use_target_bytes, size_t max_groups,
+                                       bool is_auto_worker, SpillResult &result,
                                        size_t &groups_processed) {
-        if (!storage_) {
+        if (!storage_ || step_limit == 0) {
             return false;
         }
 
@@ -1163,134 +1634,173 @@ class Mem::Impl {
             std::string rep_full_label;
             uint64_t version = 0;
             uint64_t access_seq = 0;
-            bool already_persisted = false;
-            std::vector<std::pair<std::string, std::vector<char>>> entries;
+            size_t written_bytes = 0;
+            std::vector<StorageBackend::GroupEntryItem> entries;
         };
 
-        CandidateSnap cand;
-        bool found = false;
+        std::vector<CandidateSnap> batch;
+        batch.reserve(step_limit);
+        size_t fast_evicted = 0;
 
-        // Step 1: pick the single oldest LRU group under lock (microsecond critical section)
+        // Step 1: pick up to step_limit oldest LRU groups under lock.
+        // Pre-persisted cold groups are evicted immediately via Fast Path without disk I/O!
+        // Unpersisted cold groups are marked is_persisting with zero-copy pointers.
         {
             std::lock_guard<std::mutex> lock(mutex_);
             double now = now_timestamp();
-            for (int pass = 0; pass < 2 && !found; ++pass) {
+            for (int pass = 0; pass < 2 && batch.empty() && fast_evicted == 0; ++pass) {
                 bool allow_incomplete = (pass == 1);
                 EntryGroup *group = lru_head_.lru_next;
-                while (group != &lru_head_) {
-                    if (is_candidate_eligible_unlocked(*group, allow_incomplete, now)) {
-                        cand.group_key = *group->group_key_ptr;
-                        cand.rep_full_label =
-                            make_full_label(cand.group_key, group->entries.begin()->first);
-                        cand.version = group->version;
-                        cand.access_seq = group->access_seq;
-                        cand.already_persisted = group->is_persisted;
+                while (group != &lru_head_ && (batch.size() + fast_evicted) < step_limit) {
+                    if (max_groups > 0 && (groups_processed + batch.size()) >= max_groups) {
+                        break;
+                    }
+                    if (use_target_bytes && current_bytes_ <= target_bytes && batch.empty()) {
+                        break;
+                    }
+                    EntryGroup *next = group->lru_next;
+                    bool for_persist = !group->is_persisted;
+                    if (is_candidate_eligible_unlocked(*group, allow_incomplete, now,
+                                                       for_persist)) {
+                        const std::string gk = *group->group_key_ptr;
+                        const std::string rep_fl =
+                            make_full_label(gk, group->entries.begin()->first);
 
-                        if (cand.already_persisted && !is_deletion_guarded()) {
-                            // Fast path: already persisted and no deletion guard active -> evict immediately!
-                            size_t freed = remove_unlocked(cand.rep_full_label);
-                            evictions_.fetch_add(1, std::memory_order_relaxed);
-                            result.evicted_groups++;
-                            result.evicted_bytes += freed;
-                            result.evicted_labels.push_back(cand.group_key);
-                            if (is_auto_worker) {
-                                auto_evicted_groups_.fetch_add(1, std::memory_order_relaxed);
-                                auto_evicted_bytes_.fetch_add(freed, std::memory_order_relaxed);
+                        if (group->is_persisted) {
+                            if (group->active_readers == 0 && !is_deletion_guarded()) {
+                                size_t freed = remove_unlocked(rep_fl);
+                                evictions_.fetch_add(1, std::memory_order_relaxed);
+                                result.evicted_groups++;
+                                result.evicted_bytes += freed;
+                                result.evicted_labels.push_back(gk);
+                                if (is_auto_worker) {
+                                    auto_evicted_groups_.fetch_add(1, std::memory_order_relaxed);
+                                    auto_evicted_bytes_.fetch_add(freed, std::memory_order_relaxed);
+                                }
+                                groups_processed++;
+                                fast_evicted++;
                             }
-                            groups_processed++;
-                            return true;
-                        }
-
-                        group->is_persisting = true;
-                        if (!cand.already_persisted) {
+                        } else {
+                            group->is_persisting = true;
+                            CandidateSnap cand;
+                            cand.group_key = gk;
+                            cand.rep_full_label = rep_fl;
+                            cand.version = group->version;
+                            cand.access_seq = group->access_seq;
                             cand.entries.reserve(group->entries.size());
                             for (const auto &[tensor_key, sub] : group->entries) {
                                 if (sub.data && sub.size > 0) {
-                                    std::string fl = make_full_label(cand.group_key, tensor_key);
-                                    cand.entries.emplace_back(
-                                        std::move(fl),
-                                        std::vector<char>(sub.data, sub.data + sub.size));
+                                    cand.entries.push_back({tensor_key, sub.data, sub.size});
+                                    cand.written_bytes += sub.size;
                                 }
                             }
+                            batch.push_back(std::move(cand));
                         }
-                        found = true;
-                        break;
                     }
-                    group = group->lru_next;
+                    group = next;
                 }
             }
         }
 
-        if (!found) {
-            return false;
+        if (batch.empty()) {
+            return fast_evicted > 0;
         }
 
-        // Step 2: perform disk I/O and Record update outside lock
-        bool persist_ok = cand.already_persisted;
-        size_t written_bytes = 0;
-        if (!cand.already_persisted) {
-            std::vector<StorageBackend::WriteItem> write_items;
-            write_items.reserve(cand.entries.size());
-            for (const auto &[fl, buf] : cand.entries) {
-                write_items.push_back({fl, buf.data(), buf.size()});
-                written_bytes += buf.size();
-            }
-            auto save_res = storage_->save_batch(write_items);
-            persist_ok = !save_res.empty();
-            for (bool ok : save_res) {
-                if (!ok) {
-                    persist_ok = false;
-                    break;
-                }
-            }
-            if (persist_ok && record_) {
-                record_->mark_persisted({cand.group_key});
-            }
+        // Step 2: perform aggregated group disk I/O outside lock
+        std::vector<StorageBackend::GroupWriteItem> write_groups;
+        write_groups.reserve(batch.size());
+        for (const auto &cand : batch) {
+            write_groups.push_back({cand.group_key, cand.entries});
         }
+        std::vector<bool> save_res =
+            storage_->save_groups_batch(write_groups, /*allow_parallel=*/!is_auto_worker);
 
-        // Wait for any active decompression guard outside lock
-        wait_deletion_guard();
-
-        // Step 3: verify version & access_seq under lock, then mark persisted and evict if still cold
+        // Step 3a: check version under lock BEFORE updating Record::mark_persisted
+        std::vector<std::string> valid_persisted_keys;
+        std::vector<std::string> stale_persisted_keys;
+        valid_persisted_keys.reserve(batch.size());
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            auto it = cache_.find(cand.group_key);
-            if (it == cache_.end()) {
-                return true;
-            }
-            EntryGroup &group = it->second;
-            group.is_persisting = false;
-
-            if (!cand.already_persisted && persist_ok) {
-                if (group.version == cand.version && !group.is_persisted) {
-                    group.is_persisted = true;
-                    unpersisted_remove(&group);
-                }
-                result.persisted_groups++;
-                result.persisted_bytes += written_bytes;
-                result.persisted_labels.push_back(cand.group_key);
-                if (is_auto_worker) {
-                    auto_persisted_groups_.fetch_add(1, std::memory_order_relaxed);
-                    auto_persisted_bytes_.fetch_add(written_bytes, std::memory_order_relaxed);
+            for (size_t i = 0; i < batch.size(); ++i) {
+                if (!save_res[i])
+                    continue;
+                auto it = cache_.find(batch[i].group_key);
+                if (it != cache_.end() && it->second.version == batch[i].version) {
+                    valid_persisted_keys.push_back(batch[i].group_key);
+                } else {
+                    stale_persisted_keys.push_back(batch[i].group_key);
                 }
             }
+        }
 
-            groups_processed++;
+        // Step 3b: single batched Record update outside lock for unmodified groups
+        if (record_ && !valid_persisted_keys.empty()) {
+            record_->mark_persisted(valid_persisted_keys);
+        }
+        for (const auto &sk : stale_persisted_keys) {
+            storage_->remove_group(sk);
+        }
 
-            // Only evict if the group is persisted, unmodified, AND was NOT accessed by GET
-            // while persistence was in flight!
-            if (group.is_persisted && group.version == cand.version &&
-                group.access_seq == cand.access_seq && !is_deletion_guarded()) {
-                size_t freed = remove_unlocked(cand.rep_full_label);
-                evictions_.fetch_add(1, std::memory_order_relaxed);
-                result.evicted_groups++;
-                result.evicted_bytes += freed;
-                result.evicted_labels.push_back(cand.group_key);
-                if (is_auto_worker) {
-                    auto_evicted_groups_.fetch_add(1, std::memory_order_relaxed);
-                    auto_evicted_bytes_.fetch_add(freed, std::memory_order_relaxed);
+        if (is_deletion_guarded()) {
+            wait_deletion_guard();
+        }
+
+        // Step 3c: verify version & access_seq under lock, then mark persisted and evict if still cold
+        std::unordered_set<std::string> valid_set(valid_persisted_keys.begin(),
+                                                  valid_persisted_keys.end());
+        std::vector<std::string> late_stale_keys;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto &cand : batch) {
+                auto it = cache_.find(cand.group_key);
+                if (it == cache_.end()) {
+                    continue;
+                }
+                EntryGroup &group = it->second;
+                group.is_persisting = false;
+                group.flush_retired_buffers();
+
+                if (valid_set.count(cand.group_key) > 0) {
+                    if (group.version == cand.version) {
+                        if (!group.is_persisted) {
+                            group.is_persisted = true;
+                            unpersisted_remove(&group);
+                        }
+                        result.persisted_groups++;
+                        result.persisted_bytes += cand.written_bytes;
+                        result.persisted_labels.push_back(cand.group_key);
+                        if (is_auto_worker) {
+                            auto_persisted_groups_.fetch_add(1, std::memory_order_relaxed);
+                            auto_persisted_bytes_.fetch_add(cand.written_bytes,
+                                                            std::memory_order_relaxed);
+                        }
+                    } else {
+                        late_stale_keys.push_back(cand.group_key);
+                    }
+                }
+
+                groups_processed++;
+
+                // Evict only if persisted, unmodified, not accessed by GET, and no active readers
+                if (group.is_persisted && group.version == cand.version &&
+                    group.access_seq == cand.access_seq && group.active_readers == 0 &&
+                    !is_deletion_guarded()) {
+                    if (!use_target_bytes || current_bytes_ > target_bytes) {
+                        size_t freed = remove_unlocked(cand.rep_full_label);
+                        evictions_.fetch_add(1, std::memory_order_relaxed);
+                        result.evicted_groups++;
+                        result.evicted_bytes += freed;
+                        result.evicted_labels.push_back(cand.group_key);
+                        if (is_auto_worker) {
+                            auto_evicted_groups_.fetch_add(1, std::memory_order_relaxed);
+                            auto_evicted_bytes_.fetch_add(freed, std::memory_order_relaxed);
+                        }
+                    }
                 }
             }
+        }
+        for (const auto &sk : late_stale_keys) {
+            storage_->remove_group(sk);
         }
 
         return true;
@@ -1319,7 +1829,8 @@ class Mem::Impl {
                 EntryGroup *group = lru_head_.lru_next;
                 while (group != &lru_head_ && batch.size() < step_limit) {
                     EntryGroup *next = group->lru_next;
-                    if (is_candidate_eligible_unlocked(*group, allow_incomplete, now)) {
+                    if (is_candidate_eligible_unlocked(*group, allow_incomplete, now,
+                                                       /*for_persist=*/false)) {
                         group->is_unpublishing = true;
                         const std::string &gk = *group->group_key_ptr;
                         const std::string &tk = group->entries.begin()->first;
@@ -1351,7 +1862,9 @@ class Mem::Impl {
             }
         }
 
-        wait_deletion_guard();
+        if (is_deletion_guarded()) {
+            wait_deletion_guard();
+        }
 
         // Stage 3: physically free groups that were not touched during the unpublish window
         std::unordered_map<std::string, std::vector<std::string>> resubmit_by_label;
@@ -1365,8 +1878,8 @@ class Mem::Impl {
                 group.is_unpublishing = false;
                 groups_processed++;
 
-                if (!is_deletion_guarded() && group.version == item.version &&
-                    group.access_seq == item.access_seq) {
+                if (!is_deletion_guarded() && group.active_readers == 0 &&
+                    group.version == item.version && group.access_seq == item.access_seq) {
                     size_t freed = remove_unlocked(item.rep_full_label);
                     evictions_.fetch_add(1, std::memory_order_relaxed);
                     result.evicted_groups++;
@@ -1393,8 +1906,33 @@ class Mem::Impl {
         return true;
     }
 
+    void put_loaded_group_unlocked(const std::string &group_key,
+                                   StorageBackend::LoadedGroup &&loaded_entries,
+                                   const std::unordered_set<std::string> &requested_tensor_keys,
+                                   double now) {
+        for (auto &le : loaded_entries) {
+            if (!le.data)
+                continue;
+            bool is_req = requested_tensor_keys.count(le.tensor_key) > 0;
+            std::string full_label = make_full_label(group_key, le.tensor_key);
+            put_loaded_one_unlocked(full_label, le.data, le.size, now,
+                                    /*prefetched=*/!is_req);
+            le.data = nullptr;
+            if (is_req) {
+                hits_in_storage_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // Check if any requested tensor_key was missing from the loaded group
+        auto it = cache_.find(group_key);
+        for (const auto &req_tk : requested_tensor_keys) {
+            if (it == cache_.end() || it->second.find(req_tk) == nullptr) {
+                misses_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
     void put_loaded_one_unlocked(const std::string &full_label, char *data, size_t size,
-                                 double now) {
+                                 double now, bool prefetched = false) {
         auto [group_key_sv, tensor_key_sv] = parse_full_label(full_label);
         std::string group_key(group_key_sv);
         std::string tensor_key(tensor_key_sv);
@@ -1406,10 +1944,14 @@ class Mem::Impl {
             if (sub && sub->data) {
                 // Concurrent thread already populated this sub-entry; keep existing live buffer
                 free(data);
+                if (!prefetched && sub->prefetched_from_storage) {
+                    sub->prefetched_from_storage = false;
+                }
             } else {
                 SubEntry &new_sub = group.get_or_create(tensor_key);
                 new_sub.data = data;
                 new_sub.size = size;
+                new_sub.prefetched_from_storage = prefetched;
                 current_bytes_ += size;
                 total_entries_++;
             }
@@ -1420,6 +1962,9 @@ class Mem::Impl {
             if (!group.is_persisted && group.unpersisted_next == nullptr &&
                 group.unpersisted_prev == nullptr) {
                 group.is_persisted = true;
+            }
+            if (expected_group_size_ == 0 || group.entries.size() >= expected_group_size_) {
+                group.is_complete = true;
             }
         } else {
             auto [new_it, inserted] =
@@ -1432,12 +1977,14 @@ class Mem::Impl {
             SubEntry &sub = group.get_or_create(tensor_key);
             sub.data = data;
             sub.size = size;
+            sub.prefetched_from_storage = prefetched;
             group.created_at = now;
             group.last_access = now;
             group.version = 1;
             group.access_seq = ++global_access_seq_;
             group.is_persisted = true;
-            group.is_complete = true;
+            group.is_complete =
+                (expected_group_size_ == 0 || group.entries.size() >= expected_group_size_);
 
             current_bytes_ += size;
             total_entries_++;
@@ -1463,22 +2010,50 @@ class Mem::Impl {
         auto [group_key_sv, tensor_key_sv] = parse_full_label(full_label);
         std::string group_key(group_key_sv);
         std::string tensor_key(tensor_key_sv);
+        const bool is_default_kv = (parse_group_key(group_key_sv).first == "kv");
 
         auto it = cache_.find(group_key);
         if (it != cache_.end()) {
 
             EntryGroup &group = it->second;
             SubEntry *sub = group.find(tensor_key_sv);
-            if (sub) {
+            if (sub && sub->data) {
+                if (sub->size == size && std::memcmp(sub->data, data, size) == 0) {
+                    // Content-addressed duplicate put with identical payload:
+                    // keep existing buffer immutable so active readers/persisters are unaffected.
+                    free(data);
+                    sub->prefetched_from_storage = false;
+                    group.last_access = now;
+                    group.access_seq = ++global_access_seq_;
+                    if (pre_completed_groups_.find(group_key) != pre_completed_groups_.end()) {
+                        if (expected_group_size_ == 0 || !is_default_kv ||
+                            group.entries.size() >= expected_group_size_) {
+                            pre_completed_groups_.erase(group_key);
+                            group.is_complete = true;
+                        }
+                    } else if (expected_group_size_ > 0 && is_default_kv &&
+                               group.entries.size() >= expected_group_size_) {
+                        group.is_complete = true;
+                    }
+                    lru_remove(&group);
+                    lru_push_back(&group);
+                    puts_.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
                 current_bytes_ -= sub->size;
-                if (sub->data)
+                if (group.active_readers > 0 || group.is_persisting || is_deletion_guarded()) {
+                    group.retired_buffers.push_back(sub->data);
+                } else {
                     free(sub->data);
+                }
                 sub->data = data;
                 sub->size = size;
+                sub->prefetched_from_storage = false;
             } else {
                 SubEntry &new_sub = group.get_or_create(tensor_key);
                 new_sub.data = data;
                 new_sub.size = size;
+                new_sub.prefetched_from_storage = false;
                 total_entries_++;
 
                 if (group.entries.size() > (size_t)envs.IAXL_CACHE_CACHEGROUP_SIZE) {
@@ -1493,7 +2068,14 @@ class Mem::Impl {
             group.last_access = now;
             group.version++;
             group.access_seq = ++global_access_seq_;
-            if (pre_completed_groups_.erase(group_key) > 0) {
+            if (pre_completed_groups_.find(group_key) != pre_completed_groups_.end()) {
+                if (expected_group_size_ == 0 || !is_default_kv ||
+                    group.entries.size() >= expected_group_size_) {
+                    pre_completed_groups_.erase(group_key);
+                    group.is_complete = true;
+                }
+            } else if (expected_group_size_ > 0 && is_default_kv &&
+                       group.entries.size() >= expected_group_size_) {
                 group.is_complete = true;
             }
 
@@ -1528,12 +2110,20 @@ class Mem::Impl {
             SubEntry &sub = group.get_or_create(tensor_key);
             sub.data = data;
             sub.size = size;
+            sub.prefetched_from_storage = false;
             group.created_at = now;
             group.last_access = now;
             group.version = 1;
             group.access_seq = ++global_access_seq_;
             group.is_persisted = false;
-            if (pre_completed_groups_.erase(group_key) > 0) {
+            if (pre_completed_groups_.find(group_key) != pre_completed_groups_.end()) {
+                if (expected_group_size_ == 0 || !is_default_kv ||
+                    group.entries.size() >= expected_group_size_) {
+                    pre_completed_groups_.erase(group_key);
+                    group.is_complete = true;
+                }
+            } else if (expected_group_size_ > 0 && is_default_kv &&
+                       group.entries.size() >= expected_group_size_) {
                 group.is_complete = true;
             }
 
@@ -1562,7 +2152,8 @@ class Mem::Impl {
         }
     }
 
-    std::pair<const char *, size_t> get_one_unlocked(const std::string &full_label, double now) {
+    std::pair<const char *, size_t> get_one_unlocked(const std::string &full_label, double now,
+                                                     EntryGroup **out_group = nullptr) {
         auto [group_key_sv, tensor_key_sv] = parse_full_label(full_label);
         auto it = cache_.find(std::string(group_key_sv));
         if (it != cache_.end()) {
@@ -1573,7 +2164,15 @@ class Mem::Impl {
                 group.access_seq = ++global_access_seq_;
                 lru_remove(&group);
                 lru_push_back(&group);
-                hits_.fetch_add(1, std::memory_order_relaxed);
+                if (sub->prefetched_from_storage) {
+                    sub->prefetched_from_storage = false;
+                    hits_in_storage_.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    hits_.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (out_group) {
+                    *out_group = &group;
+                }
                 return {sub->data, sub->size};
             }
         }
@@ -1586,7 +2185,7 @@ class Mem::Impl {
         EntryGroup *curr = lru_head_.lru_next;
         while (current_bytes_ > target_bytes && curr != &lru_head_) {
             EntryGroup *next = curr->lru_next;
-            if (curr->is_persisting || curr->is_unpublishing) {
+            if (curr->is_persisting || curr->is_unpublishing || curr->active_readers > 0) {
                 curr = next;
                 continue;
             }
@@ -1650,6 +2249,7 @@ class Mem::Impl {
     std::unordered_map<std::string, EntryGroup> cache_;
     std::unordered_set<std::string> pre_completed_groups_;
     bool has_complete_tracking_ = false;
+    size_t expected_group_size_ = 0;
     uint64_t global_access_seq_ = 0;
 
     EntryGroup lru_head_;
@@ -1664,6 +2264,7 @@ class Mem::Impl {
     mutable std::mutex mutex_;
 
     std::atomic<int> deletion_guard_count_{0};
+    std::atomic<int> active_group_readers_total_{0};
     std::mutex deletion_cv_mutex_;
     std::condition_variable deletion_cv_;
     std::atomic<int> active_gets_{0};
@@ -1757,6 +2358,16 @@ AutoSpillStatus Mem::auto_spill_status() const { return impl_->auto_spill_status
 void Mem::mark_groups_complete(const std::string &label,
                                const std::vector<std::string> &chunk_ids) {
     impl_->mark_groups_complete(label, chunk_ids);
+}
+
+void Mem::set_expected_group_size(size_t expected_size) {
+    impl_->set_expected_group_size(expected_size);
+}
+
+size_t Mem::expected_group_size() const { return impl_->expected_group_size(); }
+
+void Mem::release_group_guards(const std::vector<std::string> &keys) {
+    impl_->release_group_guards(keys);
 }
 
 void Mem::stop_background_workers() { impl_->stop_background_workers(); }

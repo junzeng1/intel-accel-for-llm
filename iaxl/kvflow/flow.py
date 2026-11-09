@@ -126,9 +126,16 @@ class Task:
 
 
 class KVFlow:
-    def __init__(self, persist_dir: str, cache_size_gb: float = 8.0, rank: int = 0):
+    def __init__(
+        self,
+        persist_dir: str,
+        cache_size_gb: float = 8.0,
+        rank: int = 0,
+        num_layers: int = 0,
+    ):
 
         self.enable_compression = envs.IAXL_KV_COMPRESSION
+        self.num_layers = max(0, int(num_layers))
         base_dir = envs.IAXL_CACHE_DIR
         compression_subdir = "compressed" if self.enable_compression else "raw"
         self.persist_dir = os.path.join(base_dir, compression_subdir, persist_dir)
@@ -188,6 +195,8 @@ class KVFlow:
             storage=self.storage,
             record=self.record,
         )
+        if self.num_layers > 0:
+            self.mem.set_expected_group_size(self.num_layers)
         self.mem.configure_auto_spill(
             enabled=envs.IAXL_CACHE_AUTO_SPILL_ENABLE,
             evict_only=envs.IAXL_CACHE_AUTO_SPILL_EVICT_ONLY,
