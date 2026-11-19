@@ -13,6 +13,7 @@ the data has landed. Responses and `done` pushes are plain notifications.
 import json
 import logging
 import struct
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set
@@ -28,7 +29,7 @@ CTRL_BYTES = 4 << 20
 
 HELLO, REGISTER_KV_CACHES, REGISTER_LAYERS, PUT, GET, HAS, STATUS, METRICS, PERSIST, EVICT, \
     PERSIST_CANDIDATES, EVICT_CANDIDATES, STOP, UNREGISTER, SET_BUNDLES_PRIORITY, \
-    SORT_PRIORITY_LEVEL = range(16)
+    SORT_PRIORITY_LEVEL, PUT_COMPRESSED = range(17)
 
 REQ_FMT, RESP_FMT, PUSH_FMT = "<cBIQ", "<cIB", "<cIH"
 REQ_SIZE, RESP_SIZE, PUSH_SIZE = (struct.calcsize(f) for f in (REQ_FMT, RESP_FMT, PUSH_FMT))
@@ -116,6 +117,36 @@ def unpack_json(buf: bytes):
     return json.loads(buf) if buf else None
 
 
+def pack_compressed(label: str, block_hashes: List[str], keys: List[str], blobs: List[bytes]) -> bytes:
+    """Pack compressed KV blobs for Host-to-Host RDMA spill (PUT_COMPRESSED)."""
+    lab = label.encode()
+    parts = [struct.pack("<HI", len(lab), len(keys)), lab, pack_hashes(block_hashes)]
+    for k, b in zip(keys, blobs):
+        kb = k.encode()
+        parts.append(struct.pack("<HI", len(kb), len(b)))
+        parts.append(kb)
+        parts.append(b)
+    return b"".join(parts)
+
+
+def unpack_compressed(buf: bytes):
+    nlab, nkeys = struct.unpack_from("<HI", buf, 0)
+    off = 6
+    label = buf[off:off + nlab].decode()
+    off += nlab
+    block_hashes, off = unpack_hashes(buf, off)
+    keys: List[str] = []
+    blobs: List[bytes] = []
+    for _ in range(nkeys):
+        nk, nb = struct.unpack_from("<HI", buf, off)
+        off += 6
+        keys.append(buf[off:off + nk].decode())
+        off += nk
+        blobs.append(buf[off:off + nb])
+        off += nb
+    return label, block_hashes, keys, blobs
+
+
 def _ctrl_buffer(pin: bool) -> torch.Tensor:
     return torch.empty(CTRL_BYTES, dtype=torch.uint8, device="cpu", pin_memory=pin)
 
@@ -144,28 +175,30 @@ class RpcChannel:
         self.remote_bytes = 0
         self._seq = 0
         self._resp = None
+        self._lock = threading.Lock()
 
     def handshake(self):
         info = unpack_json(self.call(HELLO))
         self.remote_base, self.remote_bytes = info["base"], info["bytes"]
 
     def call(self, method: int, payload: bytes = b"") -> bytes:
-        self._seq = seq = (self._seq + 1) & 0xFFFFFFFF
-        n = len(payload)
-        if 0 < n <= self.remote_bytes:
-            self.buf_np[:n] = np.frombuffer(payload, np.uint8)
-            self.xfer.write(self.peer, self.buf_ptr, self.remote_base, n,
-                            struct.pack(REQ_FMT, b"Q", method, seq, n))
-        else:
-            self.xfer.send_notif(self.peer, struct.pack(REQ_FMT, b"I", method, seq, n) + payload)
-        while self._resp is None:
-            self.drain()
-        rseq, ok, body = self._resp
-        self._resp = None
-        assert rseq == seq, f"rpc: response seq {rseq} != {seq}"
-        if not ok:
-            raise RuntimeError(f"rpc method {method} failed on {self.peer}: {body.decode(errors='replace')}")
-        return body
+        with self._lock:
+            self._seq = seq = (self._seq + 1) & 0xFFFFFFFF
+            n = len(payload)
+            if 0 < n <= self.remote_bytes:
+                self.buf_np[:n] = np.frombuffer(payload, np.uint8)
+                self.xfer.write(self.peer, self.buf_ptr, self.remote_base, n,
+                                struct.pack(REQ_FMT, b"Q", method, seq, n))
+            else:
+                self.xfer.send_notif(self.peer, struct.pack(REQ_FMT, b"I", method, seq, n) + payload)
+            while self._resp is None:
+                self.drain()
+            rseq, ok, body = self._resp
+            self._resp = None
+            assert rseq == seq, f"rpc: response seq {rseq} != {seq}"
+            if not ok:
+                raise RuntimeError(f"rpc method {method} failed on {self.peer}: {body.decode(errors='replace')}")
+            return body
 
     def drain(self):
         for _, msg in self.xfer.iter_notifs():
@@ -190,29 +223,82 @@ class Job:
     not_done: Set[str] = field(default_factory=set)
 
 
+@dataclass
+class ClientSession:
+    peer: str
+    client_slot: int
+    ctrl: torch.Tensor
+    ctrl_np: np.ndarray
+    ctrl_pool_name: str
+    remote_names: List[str] = field(default_factory=list)
+    pool_keys: Dict[str, str] = field(default_factory=dict)
+
+
 class KVStoreService:
-    """Daemon-side handlers. Owns the KVStore (created on register_*) and the
-    registered control buffer clients write their request payloads into."""
+    """Daemon-side handlers. Owns a shared KVStoreLocal and per-client sessions
+    (each client gets its own registered control buffer and RemoteTensor pools)."""
 
     def __init__(self, xfer, role: str, rank: int = 0, tp_size: int = 1):
         self.xfer, self.role, self.rank, self.tp_size = xfer, role, rank, tp_size
-        self.ctrl = _ctrl_buffer(pin=cuda_available())
-        self.ctrl_np = self.ctrl.numpy()
-        xfer.register_memory(self.ctrl, "rpc.ctrl")
         self.kvstore = None
         self.layer_names: List[str] = []
         self.layer_idx: Dict[str, int] = {}
-        self.remote_names: List[str] = []  # Remote KV pools registered for the current client
+        self.sessions: Dict[str, ClientSession] = {}
+        self._next_slot = 0
         self.jobs: Dict[int, Job] = {}
         self._next_job = 0
+
+        self._max_slots = 16
+        self._ctrl_slots: List[tuple[torch.Tensor, np.ndarray]] = []
+        self._free_slots: List[int] = []
+        pin = cuda_available()
+        for slot in range(self._max_slots):
+            ctrl = _ctrl_buffer(pin=pin)
+            self.xfer.register_memory(ctrl, f"rpc.ctrl.slot{slot}")
+            self._ctrl_slots.append((ctrl, ctrl.numpy()))
+            self._free_slots.append(slot)
+
+    def ctrl_buf_for(self, peer: str) -> np.ndarray:
+        sess = self.sessions.get(peer)
+        if sess is None:
+            raise KeyError(f"unknown peer {peer} (handshake required)")
+        return sess.ctrl_np
 
     # -- dispatch ------------------------------------------------------------
     def dispatch(self, peer: str, method: int, payload: bytes) -> bytes:
         return self._HANDLERS[method](self, peer, payload)
 
+    def _cleanup_session(self, peer: str):
+        sess = self.sessions.pop(peer, None)
+        if sess is None:
+            return
+        if sess.remote_names:
+            from iaxl import torch_ext
+            for pname in sess.remote_names:
+                torch_ext.unregister_kv_pool(pname)
+            sess.remote_names.clear()
+        if sess.client_slot not in self._free_slots:
+            self._free_slots.append(sess.client_slot)
+        for job_id in [jid for jid, j in self.jobs.items() if j.peer == peer]:
+            del self.jobs[job_id]
+
     def _hello(self, peer, payload):
         self.xfer.wait_peer(peer)  # we need the client's metadata to notify it
-        return pack_json({"base": self.ctrl.data_ptr(), "bytes": CTRL_BYTES})
+        if peer in self.sessions:
+            self._cleanup_session(peer)
+        if not self._free_slots:
+            raise RuntimeError(f"max client sessions ({self._max_slots}) reached")
+        slot = self._free_slots.pop(0)
+        ctrl, ctrl_np = self._ctrl_slots[slot]
+        sess = ClientSession(
+            peer=peer,
+            client_slot=slot,
+            ctrl=ctrl,
+            ctrl_np=ctrl_np,
+            ctrl_pool_name=f"rpc.ctrl.slot{slot}",
+        )
+        self.sessions[peer] = sess
+        return pack_json({"base": ctrl.data_ptr(), "bytes": CTRL_BYTES, "client_slot": slot})
 
     def _check_topology(self, req):
         if req["tp_size"] != self.tp_size:
@@ -228,22 +314,25 @@ class KVStoreService:
 
         req = unpack_json(payload)
         self._check_topology(req)
-        if self.kvstore is not None:
-            raise RuntimeError("kv_caches already registered")
+        sess = self.sessions[peer]
         block_dim = req["block_dim"]
         kv_caches = {}
         for name, t in req["layers"].items():
             dtype = getattr(torch, t["dtype"])
             shape = tuple(t["shape"])
+            pool_name = f"{peer}:{name}"
             rt = RemoteTensor(peer, t["base"], shape, dtype, t["dev_id"])
-            # One Remote pool per layer name; hybrid layers sharing a buffer share its RDMA dlist.
-            torch_ext.register_kv_pool_remote(name, peer, rt.base, list(shape), rt.element_size(),
+            # Per-peer Remote pool so multiple HeadNodes never collide on KVPool names.
+            torch_ext.register_kv_pool_remote(pool_name, peer, rt.base, list(shape), rt.element_size(),
                                               dtype, rt.dev_id, block_dim)
-            self.remote_names.append(name)
+            sess.remote_names.append(pool_name)
+            sess.pool_keys[name] = pool_name
             kv_caches[name] = rt
-        self.kvstore = KVStoreLocal(model_name=req["model_name"], block_dim=block_dim, kv_caches=kv_caches,
-                                    rank=self.rank, tp_size=self.tp_size)
-        self._set_layers(self.kvstore.layer_names)
+        if self.kvstore is None:
+            self.kvstore = KVStoreLocal(model_name=req["model_name"], block_dim=block_dim,
+                                        kv_caches=kv_caches, rank=self.rank,
+                                        tp_size=self.tp_size, shared_mode=True)
+            self._set_layers(self.kvstore.layer_names)
         return pack_json({"layer_names": self.layer_names})
 
     def _register_layers(self, peer, payload):
@@ -253,8 +342,8 @@ class KVStoreService:
         self._check_topology(req)
         if self.kvstore is None:
             self.kvstore = KVStoreLocal(model_name=req["model_name"], layer_names=req["layer_names"],
-                                        tp_size=self.tp_size)
-        self._set_layers(self.kvstore.layer_names)
+                                        tp_size=self.tp_size, shared_mode=True)
+            self._set_layers(self.kvstore.layer_names)
         return b""
 
     def _set_layers(self, names):
@@ -264,8 +353,10 @@ class KVStoreService:
     def _xfer(self, peer, payload, is_put):
         indices, hashes, layer_idx, desc, label, priorities, bundle_id = unpack_blocks(payload)
         names = [self.layer_names[i] for i in layer_idx] or None
+        sess = self.sessions[peer]
         if is_put:
-            tasks = self.kvstore.put(indices, hashes, names, desc, label=label or None)
+            tasks = self.kvstore.put(indices, hashes, names, desc, label=label or None,
+                                     pool_keys=sess.pool_keys)
         else:
             layer_priorities = None
             if priorities:
@@ -275,7 +366,8 @@ class KVStoreService:
                 for name, priority in zip(names, priorities):
                     layer_priorities[name] = priority
             tasks = self.kvstore.get(indices, hashes, names, desc, label=label or None,
-                                     priorities=layer_priorities, bundle_id=bundle_id)
+                                     priorities=layer_priorities, bundle_id=bundle_id,
+                                     pool_keys=sess.pool_keys)
         self._next_job = job_id = (self._next_job + 1) & 0xFFFFFFFF
         self.jobs[job_id] = Job(peer, tasks, is_put, set(tasks.keys()))
         return struct.pack("<I", job_id)
@@ -286,27 +378,30 @@ class KVStoreService:
     def _get(self, peer, payload):
         return self._xfer(peer, payload, False)
 
+    def _put_compressed(self, peer, payload):
+        label, block_hashes, keys, blobs = unpack_compressed(payload)
+        sess = self.sessions[peer]
+        self.kvstore.import_compressed(label, block_hashes, keys, blobs,
+                                       client_slot=sess.client_slot)
+        return b""
+
     def _has(self, peer, payload):
         hashes, label, truncate = unpack_has(payload)
-        flags = self.kvstore.has(hashes, label=label or None, truncate=truncate)
+        sess = self.sessions[peer]
+        flags = self.kvstore.has(hashes, label=label or None, truncate=truncate,
+                                 client_slot=sess.client_slot)
         return np.asarray(flags, dtype=np.uint8).tobytes()
 
     def _stop(self, peer, payload):
-        if self.kvstore is not None:
+        self._cleanup_session(peer)
+        req = unpack_json(payload) or {}
+        if req.get("force") and self.kvstore is not None:
             self.kvstore.stop()
-        self._release_remote()
+            return b"STOP"
         return b""
 
-    def _release_remote(self):
-        if self.remote_names:
-            from iaxl import torch_ext
-
-            for name in self.remote_names:
-                torch_ext.unregister_kv_pool(name)
-            self.remote_names.clear()
-
     def _unregister(self, peer, payload):
-        self._release_remote()
+        self._cleanup_session(peer)
         return b""
 
     _HANDLERS = {
@@ -326,6 +421,7 @@ class KVStoreService:
         UNREGISTER: _unregister,
         SET_BUNDLES_PRIORITY: _json_call("set_bundles_priority"),
         SORT_PRIORITY_LEVEL: _json_call("sort_priority_level"),
+        PUT_COMPRESSED: _put_compressed,
     }
 
     # -- completion polling --------------------------------------------------
@@ -352,14 +448,18 @@ def serve(xfer, service: KVStoreService, idle_spin: int = 2000, idle_sleep: floa
         for peer, msg in xfer.iter_notifs():
             busy = True
             kind, method, seq, n = struct.unpack_from(REQ_FMT, msg)
-            payload = service.ctrl_np[:n].tobytes() if kind == b"Q" else msg[REQ_SIZE:REQ_SIZE + n]
+            payload = (
+                service.ctrl_buf_for(peer)[:n].tobytes()
+                if kind == b"Q"
+                else msg[REQ_SIZE:REQ_SIZE + n]
+            )
             try:
                 ok, body = True, service.dispatch(peer, method, payload)
             except Exception as e:  # report to the caller, keep serving
                 logger.exception("rpc: method %d from %s failed", method, peer)
                 ok, body = False, str(e).encode()
             xfer.send_notif(peer, struct.pack(RESP_FMT, b"R", seq, ok) + body)
-            if method == STOP:
+            if method == STOP and ok and body == b"STOP":
                 return
         for job_id, layer_idx, peer in service.poll_done():
             busy = True

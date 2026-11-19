@@ -9,7 +9,7 @@ import threading
 import time
 import torch
 import numpy as np
-from typing import Dict, List, Mapping, Optional, Set, TYPE_CHECKING, Union, cast
+from typing import Callable, Dict, List, Mapping, Optional, Set, TYPE_CHECKING, Union, cast
 import psutil
 from ..envs import envs
 from ..kvflow import KVFlow, Task, get_accelerator_device
@@ -62,6 +62,7 @@ class KVStoreLocal:
         layer_names: Optional[List[str]] = None,
         rank: int = 0,
         tp_size: int = 1,
+        shared_mode: bool = False,
     ):
 
         if kv_caches is None and layer_names is None:
@@ -152,6 +153,12 @@ class KVStoreLocal:
         )
 
         role = "controller" if self.has_only_mode else "worker"
+        self._shared_mode = shared_mode
+        self._shared_meta_lock = threading.Lock()
+        # group_key -> [accessor_mask, access_count, last_access]
+        self._shared_meta: Dict[str, list] = {}
+        self._spill_handler: Optional[Callable[[int, int, int], None]] = None
+        self._worker_mem_lock = threading.Lock()
         self._evict_cond = threading.Condition()  # has() vs. the scheduler's evict decision
         self._evicting: Set[str] = set()  # group keys the workers are still dropping
         self._evict_enabled = True  # auto-evict switch, POST /v1/cache/evict
@@ -177,10 +184,21 @@ class KVStoreLocal:
             )
 
             def evict_labels(body, s=self):
-                s.tensorzip.mem.evict_labels(body["labels"])  # raises -> HTTP 500 -> scheduler aborts
+                labels = body["labels"]
+                with s._worker_mem_lock:
+                    s.tensorzip.record.remove(labels)
+                    s.tensorzip.mem.evict_labels(labels)  # raises -> HTTP 500 -> scheduler aborts
                 return {"rank": s.rank}
 
             mgmt_register("POST", "/v1/cache/evict_labels", evict_labels)
+            mgmt_register(
+                "POST",
+                "/v1/cache/evict_candidates",
+                lambda body, s=self: {
+                    "rank": s.rank,
+                    "labels": s.get_evict_candidates(int(body.get("count", 1024))),
+                },
+            )
             mgmt_register(
                 "GET", "/v1/cache/metrics", lambda params, s=self: s.metrics(params)
             )
@@ -218,6 +236,7 @@ class KVStoreLocal:
         layer_names: Optional[List[str]] = None,
         description: str = "",
         label: Optional[str] = None,
+        pool_keys: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Task]:
         # A non-default label is its own namespace: each block hash gets one
         # more EntryGroup and record row.
@@ -244,6 +263,7 @@ class KVStoreLocal:
             chunk_labels=block_hashs,
             description=description,
             skip_compression_count=local_skip,
+            pool_keys=pool_keys,
         )
 
         if label is not None or self.layer_names[-1] in layer_names:
@@ -279,6 +299,7 @@ class KVStoreLocal:
         label: Optional[str] = None,
         priorities: Optional[Dict[str, int]] = None,
         bundle_id: int = 0,
+        pool_keys: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Task]:
         # priorities: OMP-Main level per layer name (None: 0); bundle_id: for set_bundles_priority.
         if self.has_only_mode:
@@ -302,6 +323,7 @@ class KVStoreLocal:
             priorities=priorities,
             bundle_id=bundle_id,
             sort_keys=sort_keys,
+            pool_keys=pool_keys,
         )
 
     def set_bundles_priority(self, bundle_ids: List[int], priority: int) -> int:
@@ -332,7 +354,8 @@ class KVStoreLocal:
 
     def has(self, block_hashs: Optional[List[str]] = None,
             label: Optional[str] = None,
-            truncate: bool = True) -> List[bool]:
+            truncate: bool = True,
+            client_slot: int = 0) -> List[bool]:
         if not block_hashs:
             self.tensorzip.record_flush()
             return []
@@ -346,6 +369,10 @@ class KVStoreLocal:
             if self.has_only_mode:
                 # Every hit, including those past the truncation point that the connector re-saves.
                 self.tensorzip.record.touch(label, block_hashs)
+                if self._shared_mode:
+                    hits = [h for h, ok in zip(block_hashs, results) if ok]
+                    if hits:
+                        self.record_shared_access(label, hits, client_slot)
         if not truncate:
             return results
 
@@ -357,6 +384,52 @@ class KVStoreLocal:
 
         return results
 
+    def record_shared_access(self, label: str, block_hashes: List[str], client_slot: int = 0) -> None:
+        if not self._shared_mode or not block_hashes:
+            return
+        now = time.time()
+        bit = 1 << (client_slot & 63)
+        with self._shared_meta_lock:
+            for h in block_hashes:
+                gk = f"{label}:{h}"
+                entry = self._shared_meta.get(gk)
+                if entry is None:
+                    self._shared_meta[gk] = [bit, 1, now]
+                else:
+                    entry[0] |= bit
+                    entry[1] += 1
+                    entry[2] = now
+
+    def export_compressed(self, group_keys: List[str]) -> tuple[List[str], List[bytes]]:
+        """Read already-compressed SubEntry blobs for `group_keys` (label:hash) directly
+        from Mem without decompression, for Host-to-Host RDMA spill."""
+        if self.has_only_mode:
+            raise RuntimeError("export_compressed() not available in has-only mode")
+        out_keys: List[str] = []
+        out_blobs: List[bytes] = []
+        mem = self.tensorzip.mem
+        for gk in group_keys:
+            full_keys = [f"{gk}:{ln}" for ln in self.layer_names]
+            try:
+                blobs = mem.get(full_keys)
+            except RuntimeError:
+                continue
+            out_keys.extend(full_keys)
+            out_blobs.extend(blobs)
+        return out_keys, out_blobs
+
+    def import_compressed(self, label: str, block_hashes: List[str],
+                          keys: List[str], blobs: List[bytes],
+                          client_slot: int = 0) -> None:
+        """Write already-compressed blobs directly into Mem and submit Record metadata,
+        skipping ScratchPool and re-compression."""
+        if not self.has_only_mode and keys:
+            self.tensorzip.mem.put(keys, blobs)
+            self.tensorzip.put_finish(label, block_hashes)
+            self.tensorzip.record_flush()
+        elif self.has_only_mode and self._shared_mode:
+            self.record_shared_access(label, block_hashes, client_slot)
+
     def stop(self):
         if self.has_only_mode:
             self._monitor_stop.set()
@@ -364,6 +437,56 @@ class KVStoreLocal:
         self.tensorzip.stop()
 
     _EVICT_BATCH = 16384
+
+    def _select_shared_evict_labels(self, max_count: int, min_count: int, cutoff: float) -> List[str]:
+        """Select eviction candidates on a shared daemon ordered by:
+        (num_accessor_nodes ASC, access_count ASC, last_access ASC).
+        Includes unshared/bypassed groups present in worker Mem LRU even if absent from _shared_meta."""
+        with self._shared_meta_lock:
+            shared_protected = {
+                gk for gk, (mask, _, _) in self._shared_meta.items() if mask.bit_count() >= 2
+            }
+            shared_meta_snapshot = dict(self._shared_meta)
+
+        selected: List[str] = []
+        selected_set: Set[str] = set()
+        if self._controller is not None:
+            fetch_n = max_count + len(shared_protected) + 512
+            resp = self._controller.broadcast(
+                lambda c: c.post("/v1/cache/evict_candidates", {"count": fetch_n}),
+                ranks=[0],
+            )["0"]
+            for gk in resp.get("labels", []):
+                if len(selected) >= max_count:
+                    break
+                if gk in shared_protected:
+                    continue
+                meta = shared_meta_snapshot.get(gk)
+                if meta is not None and meta[2] >= cutoff and len(selected) >= min_count:
+                    continue
+                selected.append(gk)
+                selected_set.add(gk)
+
+        if len(selected) < min_count and shared_meta_snapshot:
+            items = sorted(
+                shared_meta_snapshot.items(),
+                key=lambda kv: (kv[1][0].bit_count(), kv[1][1], kv[1][2]),
+            )
+            for gk, (_mask, _cnt, last_acc) in items:
+                if len(selected) >= max_count:
+                    break
+                if gk in selected_set:
+                    continue
+                if last_acc < cutoff or len(selected) < min_count:
+                    selected.append(gk)
+                    selected_set.add(gk)
+
+        if selected:
+            with self._shared_meta_lock:
+                for gk in selected:
+                    self._shared_meta.pop(gk, None)
+            self.tensorzip.record.remove(selected)
+        return selected
 
     def evict_lru(self, max_count: int, min_count: int = 0) -> int:
         # Evicts up to max_count lease-expired groups, and at least min_count groups even if
@@ -375,12 +498,18 @@ class KVStoreLocal:
                 self._evict_cond.wait_for(lambda: not self._evicting)  # one eviction at a time
                 if not self._evict_enabled:  # switched off after _monitor_loop checked
                     break
-                labels, self._evicted_until = self.tensorzip.record.evict(
-                    self._evicted_until,
-                    time.time() - envs.IAXL_DDR_POOL_EVICT_LEASE_S,
-                    min(self._EVICT_BATCH, max_count - evicted),
-                    max(0, min(self._EVICT_BATCH, min_count - evicted)),
-                )
+                cutoff = time.time() - envs.IAXL_DDR_POOL_EVICT_LEASE_S
+                batch_max = min(self._EVICT_BATCH, max_count - evicted)
+                batch_min = max(0, min(self._EVICT_BATCH, min_count - evicted))
+                if self._shared_mode and self._shared_meta:
+                    labels = self._select_shared_evict_labels(batch_max, batch_min, cutoff)
+                else:
+                    labels, self._evicted_until = self.tensorzip.record.evict(
+                        self._evicted_until,
+                        cutoff,
+                        batch_max,
+                        batch_min,
+                    )
                 if not labels:
                     break
                 # has() on these waits until every rank has dropped them.
@@ -401,9 +530,16 @@ class KVStoreLocal:
 
     @_abort_on_error
     def _monitor_loop(self) -> None:
-        # Rank 0's DDR pool stands for all ranks: logs its status and drives auto eviction.
+        # Rank 0's DDR pool stands for all ranks: logs its status and drives auto eviction / spill.
         last_evict_check = time.monotonic()
-        while not self._monitor_stop.wait(self._MONITOR_INTERVAL_S):
+        last_spill_check = time.monotonic()
+        spilling = False
+        # _spill_handler is attached after this thread starts, so re-evaluate every tick.
+        while not self._monitor_stop.wait(
+            min(self._MONITOR_INTERVAL_S, envs.IAXL_DDR_POOL_SPILL_INTERVAL_S)
+            if self._spill_handler is not None
+            else self._MONITOR_INTERVAL_S
+        ):
             st = self._controller.broadcast(
                 lambda c: c.get("/v1/cache/simple_status"), ranks=[0]
             )["0"]
@@ -412,13 +548,31 @@ class KVStoreLocal:
             self._log_pool_status(st)
 
             now = time.monotonic()
+            cap = st["capacity_bytes"]
+            cur = st["current_bytes"]
+            if (
+                self._spill_handler is not None
+                and self._evict_enabled
+                and cap
+                and st["group_count"]
+                and now - last_spill_check >= envs.IAXL_DDR_POOL_SPILL_INTERVAL_S
+            ):
+                last_spill_check = now
+                usage = cur / cap
+                # Hysteresis: once triggered at HIGH keep spilling until usage drops to LOW.
+                if usage >= envs.IAXL_DDR_POOL_SPILL_HIGH_WATERMARK or (
+                    spilling and usage > envs.IAXL_DDR_POOL_SPILL_LOW_WATERMARK
+                ):
+                    spilling = True
+                    self._spill_handler(cur, cap, st["group_count"])
+                    continue
+                spilling = False
+
             if now - last_evict_check < envs.IAXL_DDR_POOL_EVICT_INTERVAL_S:
                 continue
             last_evict_check = now
-            if not self._evict_enabled or not st["capacity_bytes"]:  # 0 = unlimited pool
+            if not self._evict_enabled or not cap:  # 0 = unlimited pool
                 continue
-            cap = st["capacity_bytes"]
-            cur = st["current_bytes"]
             usage = cur / cap
             if usage >= envs.IAXL_DDR_POOL_EVICT_HIGH_WATERMARK and st["group_count"]:
                 # Groups are about the same size; Mem only warns when over budget, so cur may
@@ -477,11 +631,13 @@ class KVStoreLocal:
         # Just what _monitor_loop needs; skips the O(n) unpersisted_count walk of status().
         mem = self.tensorzip.mem
         vm = psutil.virtual_memory()
+        with self._worker_mem_lock:
+            current_bytes, group_count = mem.current_bytes, mem.group_count
         return {
             "rank": self.rank,
-            "current_bytes": mem.current_bytes,
+            "current_bytes": current_bytes,
             "capacity_bytes": mem.capacity_bytes,
-            "group_count": mem.group_count,
+            "group_count": group_count,
             "total_zip_bytes": mem.total_zip_bytes,
             "total_unzip_bytes": mem.total_unzip_bytes,
             "evictions": mem.evictions,
@@ -522,14 +678,25 @@ class KVStoreLocal:
         return self.tensorzip.get_persist_candidates(max_count)
 
     def get_evict_candidates(self, max_count: int) -> List[str]:
-        return self.tensorzip.get_evict_candidates(max_count)
+        # Keep the LRU snapshot ordered with worker-side phase-two eviction.
+        with self._worker_mem_lock:
+            return self.tensorzip.get_evict_candidates(max_count)
+
+    def mem_usage(self) -> tuple[int, int]:
+        with self._worker_mem_lock:
+            mem = self.tensorzip.mem
+            return mem.current_bytes, mem.capacity_bytes
 
 
 if TYPE_CHECKING:  # the two shells share one interface; pick the local one for typing
     KVStore = KVStoreLocal
-elif envs.IAXL_RDMA_ENABLE:
+elif envs.IAXL_RDMA_ENABLE and envs.IAXL_DDR_POOL_SIZE_GB == 0:
     from ..remote_pool.kvstore_remote import KVStoreRemote
 
     KVStore = KVStoreRemote
+elif envs.IAXL_RDMA_ENABLE:
+    from .hybrid import HybridKVStore
+
+    KVStore = HybridKVStore
 else:
     KVStore = KVStoreLocal

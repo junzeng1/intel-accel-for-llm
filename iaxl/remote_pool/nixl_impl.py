@@ -31,6 +31,35 @@ def parse_nic_ips(ips: str | None, name: str) -> list[str]:
     return lst
 
 
+def parse_daemon_nodes(raw: str | None, default_port: int,
+                       name: str = "IAXL_RDMA_DAEMON_NIC_IPS") -> list[tuple[str, int, list[str]]]:
+    """Parse '|' separated daemon nodes; each node is a comma-separated NIC IP list with
+    optional ':port' on the first (or any) entry, e.g. '10.10.10.10|10.10.10.12:5565,10.10.11.12'.
+    Returns list of (ctrl_ip, port, all_ips)."""
+    nodes_raw = [n.strip() for n in (raw or "").split("|")]
+    if not nodes_raw or not all(nodes_raw):
+        raise ValueError(f"{name} is required (got {raw!r})")
+    result: list[tuple[str, int, list[str]]] = []
+    for node_str in nodes_raw:
+        entries = parse_nic_ips(node_str, name)
+        port = default_port
+        clean_ips: list[str] = []
+        for idx, entry in enumerate(entries):
+            if ":" in entry:
+                ip_part, port_part = entry.rsplit(":", 1)
+                ip_part = ip_part.strip()
+                if not ip_part:
+                    raise ValueError(f"{name}: empty IP in {entry!r}")
+                p = int(port_part)
+                if idx == 0:
+                    port = p
+                clean_ips.append(ip_part)
+            else:
+                clean_ips.append(entry)
+        result.append((clean_ips[0], port, clean_ips))
+    return result
+
+
 def configure_ucx_env(ips: list[str], rank: int | None = None) -> str:
     """Pin UCX to the RDMA NIC owning this process's IP. Must run before `import nixl`.
 

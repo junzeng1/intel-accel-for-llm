@@ -108,10 +108,19 @@ class Envs:
 
         self.IAXL_RDMA_ENABLE = _bool("IAXL_RDMA_ENABLE")
         # Comma lists (a single IP is allowed): rank r uses entry r % len; entry 0 is also the control-plane IP.
+        # Multiple daemon nodes are separated by '|', e.g. "10.10.10.10|10.10.10.12,10.10.11.12".
         self.IAXL_RDMA_DAEMON_NIC_IPS = _str("IAXL_RDMA_DAEMON_NIC_IPS", "")
         self.IAXL_RDMA_CLIENT_NIC_IPS = _str("IAXL_RDMA_CLIENT_NIC_IPS", "")
         self.IAXL_RDMA_DAEMON_PORT = _int("IAXL_RDMA_DAEMON_PORT", 5555)
         self.IAXL_RDMA_TP_SIZE = _int("IAXL_RDMA_TP_SIZE", 1)
+
+        # Hybrid (local DDR + remote shared daemon/cluster) & multi-HeadNode settings
+        self.IAXL_CLIENT_ID = _str("IAXL_CLIENT_ID", "")
+        self.IAXL_DDR_POOL_SPILL_HIGH_WATERMARK = _float("IAXL_DDR_POOL_SPILL_HIGH_WATERMARK", 0.75)
+        self.IAXL_DDR_POOL_SPILL_LOW_WATERMARK = _float("IAXL_DDR_POOL_SPILL_LOW_WATERMARK", 0.60)
+        self.IAXL_DDR_POOL_SPILL_INTERVAL_S = _float("IAXL_DDR_POOL_SPILL_INTERVAL_S", 5.0)
+        self.IAXL_HYBRID_BYPASS_SINGLE_REQ_RATIO = _float("IAXL_HYBRID_BYPASS_SINGLE_REQ_RATIO", 0.30)
+        self.IAXL_HYBRID_PROMOTE_HIT_COUNT = max(0, _int("IAXL_HYBRID_PROMOTE_HIT_COUNT", 2))
 
         self.IAXL_PROFILE_MODE = _str("IAXL_PROFILE_MODE", "").strip().lower()
         self.IAXL_METRICS_ENABLED = _bool("IAXL_METRICS_ENABLED")

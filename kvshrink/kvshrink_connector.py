@@ -253,7 +253,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             )
         else:
             self.kvstore = None
-            if not iaxl_envs.IAXL_RDMA_ENABLE:  # compression/DSA run on the daemon node
+            # Pure-remote mode runs compression/DSA on the daemon; hybrid/local modes need local bindings.
+            if not (iaxl_envs.IAXL_RDMA_ENABLE and iaxl_envs.IAXL_DDR_POOL_SIZE_GB == 0):
                 self._bind_cpu_affinity()
                 self._bind_intel_accel()
 

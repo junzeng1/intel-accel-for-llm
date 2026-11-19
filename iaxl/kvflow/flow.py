@@ -230,8 +230,10 @@ class KVFlow:
         chunk_labels: List[str],
         description: str = "",
         skip_compression_count: int = 0,
+        pool_keys: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Task]:
-        """tensor_keys: names of registered KV pools (one per layer)."""
+        """tensor_keys: names of registered KV pools (one per layer), or logical keys
+        when `pool_keys` maps each tensor_key to its registered KV pool name."""
 
         self._ensure_streams()
         assert tensor_keys, "tensor_keys must not be empty"
@@ -245,8 +247,9 @@ class KVFlow:
         num_chunks = len(chunk_indices)
 
         for tensor_index, tensor_key in enumerate(tensor_keys):
+            pool_name = pool_keys.get(tensor_key, tensor_key) if pool_keys else tensor_key
             ctx = self._create_ctx(
-                tensor_key, GpuTransferDirection.D2H, description, work_stream=self.put_stream
+                pool_name, GpuTransferDirection.D2H, description, work_stream=self.put_stream
             )
             if first_tensor:
                 if self.device_type is not None:
@@ -324,8 +327,10 @@ class KVFlow:
         priorities: Optional[Dict[str, int]] = None,
         bundle_id: int = 0,
         sort_keys: Optional[Dict[str, int]] = None,
+        pool_keys: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Task]:
-        """tensor_keys: names of registered KV pools (one per layer).
+        """tensor_keys: names of registered KV pools (one per layer), or logical keys
+        when `pool_keys` maps each tensor_key to its registered KV pool name.
         priorities / sort_keys: OMP-Main level / sort key per tensor key (None: 0 / -1)."""
 
         self._ensure_streams()
@@ -345,8 +350,9 @@ class KVFlow:
 
         first_tensor = True
         for tensor_key in tensor_keys:
+            pool_name = pool_keys.get(tensor_key, tensor_key) if pool_keys else tensor_key
             ctx = self._create_ctx(
-                tensor_key, GpuTransferDirection.H2D, description, work_stream=self.get_stream
+                pool_name, GpuTransferDirection.H2D, description, work_stream=self.get_stream
             )
             if first_tensor:
                 if stream_sync_on_get and self.device_type is not None:
@@ -541,10 +547,10 @@ class KVFlow:
     def get_evict_candidates(self, max_count: int) -> List[str]:
         if self.has_only_mode:
             return []
-        entries = self.mem.get_lru_oldest(max_count)
+        entries = self.mem.get_lru_oldest_labels(max_count)
         seen: set = set()
         result: List[str] = []
-        for full_label, _ in entries:
+        for full_label in entries:
             group_key = full_label.rsplit(":", 1)[0]
             if group_key not in seen:
                 seen.add(group_key)

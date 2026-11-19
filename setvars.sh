@@ -216,12 +216,17 @@ export IAXL_API_CONTROLLER_PORT=${IAXL_API_CONTROLLER_PORT:-18700}   # Controlle
 export IAXL_API_TIMEOUT=${IAXL_API_TIMEOUT:-60}                      # HTTP request timeout in seconds
 
 # ---- Remote pool (KVStore daemon over RDMA/NIXL) ----------------------------
-export IAXL_RDMA_ENABLE=${IAXL_RDMA_ENABLE:-0}                # Use remote KVStore daemon instead of local KVStore (0/1)
-export IAXL_RDMA_DAEMON_NIC_IPS=${IAXL_RDMA_DAEMON_NIC_IPS:-} # Daemon RDMA NIC IPs per rank (a single IP is allowed); first is also the control-plane IP (required)
+export IAXL_RDMA_ENABLE=${IAXL_RDMA_ENABLE:-0}                # Use remote KVStore daemon/hybrid mode (0/1)
+export IAXL_RDMA_DAEMON_NIC_IPS=${IAXL_RDMA_DAEMON_NIC_IPS:-} # Daemon RDMA NIC IPs per rank (',' for multi-NIC, '|' for multi-daemon)
 export IAXL_RDMA_CLIENT_NIC_IPS=${IAXL_RDMA_CLIENT_NIC_IPS:-} # Client RDMA NIC IPs per rank (a single IP is allowed); first is also the scheduler IP (required on client)
 export IAXL_RDMA_DAEMON_PORT=${IAXL_RDMA_DAEMON_PORT:-5555}   # Scheduler port; rank r listens on port+1+r
 export IAXL_RDMA_TP_SIZE=${IAXL_RDMA_TP_SIZE:-$TP_SIZE}       # Daemon rank process count (must equal client TP)
-
+export IAXL_CLIENT_ID=${IAXL_CLIENT_ID:-}                     # Optional unique HeadNode ID for multi-client daemon isolation
+export IAXL_DDR_POOL_SPILL_HIGH_WATERMARK=${IAXL_DDR_POOL_SPILL_HIGH_WATERMARK:-0.75} # Hybrid mode: local DDR high watermark to spill to remote
+export IAXL_DDR_POOL_SPILL_LOW_WATERMARK=${IAXL_DDR_POOL_SPILL_LOW_WATERMARK:-0.60}   # Hybrid mode: local DDR low watermark after spill
+export IAXL_DDR_POOL_SPILL_INTERVAL_S=${IAXL_DDR_POOL_SPILL_INTERVAL_S:-5}            # Hybrid mode: background spill check interval (s)
+export IAXL_HYBRID_BYPASS_SINGLE_REQ_RATIO=${IAXL_HYBRID_BYPASS_SINGLE_REQ_RATIO:-0.30} # Bypass local DDR if single request exceeds this ratio of local pool
+export IAXL_HYBRID_PROMOTE_HIT_COUNT=${IAXL_HYBRID_PROMOTE_HIT_COUNT:-2}              # Mirror local blocks to remote after N hits (0 = disabled)
 HOST_IP=$(ip route get 1 | awk '{print $7}' | tr -d '\n')
 export no_proxy=localhost,127.0.0.1,localaddress,.localdomain.com,.local,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,${HOST_IP}
 if env_truthy "$IAXL_RDMA_ENABLE" && [[ -n "$IAXL_RDMA_DAEMON_NIC_IPS" ]]; then

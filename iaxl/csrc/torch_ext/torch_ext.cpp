@@ -464,28 +464,58 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "Get oldest unpersisted entries as list of (key, data) tuples", py::arg("max_count"))
 
         .def(
+            "get_lru_oldest_labels",
+            [](kv_pool::Mem &self, size_t max_count) {
+                std::vector<std::string> labels;
+                {
+                    py::gil_scoped_release release;
+                    self.lock();
+                    try {
+                        auto entries = self.get_lru_oldest_unlocked(max_count);
+                        labels.reserve(entries.size());
+                        for (const auto &[key, data, size] : entries) {
+                            (void)data;
+                            (void)size;
+                            labels.push_back(key);
+                        }
+                        self.unlock();
+                    } catch (...) {
+                        self.unlock();
+                        throw;
+                    }
+                }
+                return labels;
+            },
+            "Get oldest LRU entry labels without copying cache payloads", py::arg("max_count"))
+
+        .def(
             "get_lru_oldest",
             [](kv_pool::Mem &self, size_t max_count) {
-                py::gil_scoped_release release;
-                PROFILE_SCOPE("get_lru_oldest_pyapi");
-                self.lock();
-                try {
-                    auto entries = self.get_lru_oldest_unlocked(max_count);
-
-                    py::gil_scoped_acquire acquire;
-                    py::list result;
-                    for (const auto &[key, data, size] : entries) {
-                        if (data && size > 0) {
-                            result.append(py::make_tuple(key, py::bytes(data, size)));
+                std::vector<std::pair<std::string, std::string>> copied_entries;
+                {
+                    py::gil_scoped_release release;
+                    PROFILE_SCOPE("get_lru_oldest_pyapi");
+                    self.lock();
+                    try {
+                        auto entries = self.get_lru_oldest_unlocked(max_count);
+                        copied_entries.reserve(entries.size());
+                        for (const auto &[key, data, size] : entries) {
+                            if (data && size > 0) {
+                                copied_entries.emplace_back(key, std::string(data, size));
+                            }
                         }
+                        self.unlock();
+                    } catch (...) {
+                        self.unlock();
+                        throw;
                     }
-
-                    self.unlock();
-                    return result;
-                } catch (...) {
-                    self.unlock();
-                    throw;
                 }
+
+                py::list result;
+                for (const auto &[key, data] : copied_entries) {
+                    result.append(py::make_tuple(key, py::bytes(data)));
+                }
+                return result;
             },
             "Get oldest LRU entries as list of (key, data) tuples (for eviction)",
             py::arg("max_count"))
